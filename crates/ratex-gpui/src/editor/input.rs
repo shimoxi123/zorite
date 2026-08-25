@@ -44,6 +44,17 @@ pub fn type_char(top: &mut Row, cursor: &mut Cursor, ch: char) {
             },
         ),
         ')' => close_delim(cursor),
+        // A typed brace is the literal `\{…\}` pair, mirroring `(` — a bare `{` Sym
+        // would be TeX group syntax and render as nothing (#77).
+        '{' => cursor.insert(
+            top,
+            Atom::Delim {
+                open: r"\{".into(),
+                body: Row::new(),
+                close: r"\}".into(),
+            },
+        ),
+        '}' => close_delim(cursor),
         ' ' => exit_structure(cursor),
         _ => cursor.insert(top, Atom::Sym(ch.to_string())),
     }
@@ -104,6 +115,9 @@ enum Command {
     OpSub(&'static str),
     /// A matrix — a 2×2 grid of empty cells (caret into the top-left).
     Matrix,
+    /// An accent (`\hat`, `\bar`, …) over an editable base. With a selection it wraps
+    /// it; otherwise an empty base (caret inside).
+    Accent(&'static str),
 }
 
 /// The known `\commands`. Table order is the autocomplete order.
@@ -117,6 +131,12 @@ const COMMANDS: &[(&str, Command)] = &[
     ("brace", Command::Delim(r"\{", r"\}")), ("abs", Command::Delim("|", "|")),
     ("norm", Command::Delim(r"\|", r"\|")), ("angle", Command::Delim(r"\langle", r"\rangle")),
     ("floor", Command::Delim(r"\lfloor", r"\rfloor")), ("ceil", Command::Delim(r"\lceil", r"\rceil")),
+    // accents (wrap a selection, or insert an empty base)
+    ("hat", Command::Accent(r"\hat")), ("widehat", Command::Accent(r"\widehat")),
+    ("bar", Command::Accent(r"\bar")), ("vec", Command::Accent(r"\vec")),
+    ("tilde", Command::Accent(r"\tilde")), ("widetilde", Command::Accent(r"\widetilde")),
+    ("dot", Command::Accent(r"\dot")), ("ddot", Command::Accent(r"\ddot")),
+    ("check", Command::Accent(r"\check")), ("breve", Command::Accent(r"\breve")),
     // operators / functions
     ("int", Command::OpLimits(r"\int")), ("iint", Command::OpLimits(r"\iint")),
     ("oint", Command::OpLimits(r"\oint")), ("sum", Command::OpLimits(r"\sum")),
@@ -237,6 +257,13 @@ pub fn commit_command(top: &mut Row, cursor: &mut Cursor, name: &str) -> bool {
                 close: close.to_string(),
             },
         ),
+        Some(Command::Accent(accent)) => cursor.insert(
+            top,
+            Atom::Accent {
+                accent: accent.to_string(),
+                base: Row::new(),
+            },
+        ),
         None => return false,
     }
     true
@@ -268,6 +295,10 @@ pub fn commit_command_selecting(
         }
         (Some(Command::Delim(open, close)), Some((lo, hi))) => {
             cursor.wrap_delim(top, lo, hi, open, close);
+            true
+        }
+        (Some(Command::Accent(accent)), Some((lo, hi))) => {
+            cursor.wrap_accent(top, lo, hi, accent);
             true
         }
         _ => commit_command(top, cursor, name),
@@ -324,6 +355,21 @@ mod tests {
             type_char(&mut top, &mut cur, ch);
         }
         top
+    }
+
+    #[test]
+    fn typed_braces_are_a_literal_pair() {
+        // `{x}` types as the `\{…\}` delimiter, `}` hops out — never a bare group (#77).
+        assert_eq!(typed("{x}y").to_latex(), r"\left\{ x \right\} y");
+    }
+
+    #[test]
+    fn hat_command_descends_into_base() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        assert!(commit_command(&mut top, &mut cur, "hat"));
+        type_char(&mut top, &mut cur, 'X');
+        assert_eq!(top.to_latex(), r"\hat{X}");
     }
 
     #[test]

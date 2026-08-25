@@ -488,6 +488,9 @@ impl MathEditor {
                     self.pending.as_mut().unwrap().push(c);
                     self.selected = 0;
                 }
+                // `{` commits like enter — LaTeX muscle memory types `\hat{` and expects
+                // the structure's slot to open (#77); the brace itself is consumed.
+                Some('{') => self.commit_pending(),
                 _ => return false,
             },
         }

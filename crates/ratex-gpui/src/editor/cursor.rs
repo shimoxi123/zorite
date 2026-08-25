@@ -20,6 +20,8 @@ pub enum Slot {
     Radicand,
     Index,
     Body,
+    /// An accent's base row.
+    Base,
     Sup,
     Sub,
     /// A matrix cell at (row, column).
@@ -52,6 +54,7 @@ pub(crate) fn nav_slots(atom: &Atom) -> Vec<Slot> {
             }
         }
         Atom::Delim { .. } => vec![Slot::Body],
+        Atom::Accent { .. } => vec![Slot::Base],
         Atom::Matrix { rows } => (0..rows.len())
             .flat_map(|r| (0..rows[r].len()).map(move |c| Slot::Cell(r, c)))
             .collect(),
@@ -77,6 +80,7 @@ fn slot_row(atom: &Atom, slot: Slot) -> &Row {
         (Atom::Sqrt { radicand, .. }, Slot::Radicand) => radicand,
         (Atom::Sqrt { index: Some(i), .. }, Slot::Index) => i,
         (Atom::Delim { body, .. }, Slot::Body) => body,
+        (Atom::Accent { base, .. }, Slot::Base) => base,
         (Atom::SupSub { sub: Some(r), .. }, Slot::Sub) => r,
         (Atom::SupSub { sup: Some(r), .. }, Slot::Sup) => r,
         (Atom::Matrix { rows }, Slot::Cell(r, c)) => &rows[r][c],
@@ -91,6 +95,7 @@ fn slot_row_mut(atom: &mut Atom, slot: Slot) -> &mut Row {
         (Atom::Sqrt { radicand, .. }, Slot::Radicand) => radicand,
         (Atom::Sqrt { index: Some(i), .. }, Slot::Index) => i,
         (Atom::Delim { body, .. }, Slot::Body) => body,
+        (Atom::Accent { base, .. }, Slot::Base) => base,
         (Atom::SupSub { sub: Some(r), .. }, Slot::Sub) => r,
         (Atom::SupSub { sup: Some(r), .. }, Slot::Sup) => r,
         (Atom::Matrix { rows }, Slot::Cell(r, c)) => &mut rows[r][c],
@@ -384,6 +389,17 @@ impl Cursor {
         }
     }
 
+    /// Wrap a selection (`lo..hi`) under an accent (`\hat`, `\bar`, …) — the selection
+    /// becomes the base. Caret lands just after the accent.
+    pub fn wrap_accent(&mut self, top: &mut Row, lo: usize, hi: usize, accent: &str) {
+        if let Some(at) = self.wrap_range(top, lo, hi, |base| Atom::Accent {
+            accent: accent.to_string(),
+            base,
+        }) {
+            self.index = at + 1;
+        }
+    }
+
     /// Wrap a selection (`lo..hi`) under a square root. Caret lands just after the root.
     pub fn wrap_sqrt(&mut self, top: &mut Row, lo: usize, hi: usize) {
         if let Some(at) = self.wrap_range(top, lo, hi, |radicand| Atom::Sqrt {
@@ -634,6 +650,44 @@ mod tests {
         cur.move_right(&top); // sup end -> out after the script
         assert_eq!(cur.path, vec![]);
         assert_eq!(cur.index, 2);
+    }
+
+    #[test]
+    fn accent_descend_type_and_exit() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        cur.insert(
+            &mut top,
+            Atom::Accent {
+                accent: r"\hat".into(),
+                base: Row::new(),
+            },
+        );
+        // insert descends into the base slot
+        assert_eq!(
+            cur.path,
+            vec![Step {
+                atom: 0,
+                slot: Slot::Base
+            }]
+        );
+        cur.insert(&mut top, sym("X"));
+        assert_eq!(top.to_latex(), r"\hat{X}");
+        cur.move_right(&top); // base end -> out after the accent
+        assert_eq!(cur.path, vec![]);
+        assert_eq!(cur.index, 1);
+    }
+
+    #[test]
+    fn wrap_accent_wraps_a_range_caret_after() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        for c in ["x", "y"] {
+            cur.insert(&mut top, sym(c));
+        }
+        cur.wrap_accent(&mut top, 0, 2, r"\bar");
+        assert_eq!(top.to_latex(), r"\bar{x y}");
+        assert_eq!(cur.index, 1);
     }
 
     #[test]
