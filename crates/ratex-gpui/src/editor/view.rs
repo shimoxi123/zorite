@@ -87,6 +87,8 @@ pub struct MathEditor {
     toolbar_off: (f32, f32),
     /// During a toolbar drag: the previous cursor position, for delta-based movement.
     toolbar_drag: Option<(f32, f32)>,
+    /// During an autocomplete-scrollbar drag: (grab mouse y, scrolled px at grab).
+    thumb_drag: Option<(f32, f32)>,
     /// In-line edit mode (hosted in a note's text flow): left-align the formula at its spot
     /// and hide the floating palette + white background, vs the centered standalone editor.
     inline: bool,
@@ -239,6 +241,7 @@ impl MathEditor {
             palette_drag: None,
             toolbar_off: (0.0, 8.0),
             toolbar_drag: None,
+            thumb_drag: None,
             inline,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -499,19 +502,11 @@ impl MathEditor {
     }
 
     /// Scroll the autocomplete dropdown so the highlighted match stays visible — the list can
-    /// run past the height cap (the full `\` menu is ~75 entries). Mirrors the host slash menu.
+    /// run past the height cap (the full `\` menu is ~75 entries). gpui's `scroll_to_item`
+    /// uses the MEASURED child + viewport bounds at prepaint; the previous hand-rolled
+    /// `DROP_ITEM_H`/`DROP_MAX_H` math drifted whenever they disagreed with the paint.
     fn scroll_match_into_view(&self) {
-        let top = self.selected as f32 * DROP_ITEM_H;
-        let bot = top + DROP_ITEM_H;
-        let cur = -f32::from(self.match_scroll.offset().y);
-        let new = if top < cur {
-            top
-        } else if bot > cur + DROP_MAX_H {
-            bot - DROP_MAX_H
-        } else {
-            return;
-        };
-        self.match_scroll.set_offset(point(px(0.0), px(-new)));
+        self.match_scroll.scroll_to_item(self.selected);
     }
 
     /// Resolve the pending `\name`: the highlighted match, else the literal letters.
@@ -928,7 +923,16 @@ impl Render for MathEditor {
                 .flex()
                 .flex_col()
                 .children(matches.iter().enumerate().map(|(i, name)| {
-                    let row = div().px_2().py_1().child(format!("\\{name}"));
+                    // Pinned to DROP_ITEM_H so the scroll-into-view + thumb math (which
+                    // multiply by it) match the painted rows — padding-derived heights
+                    // drifted ~3px/row and the highlight walked off before scrolling.
+                    let row = div()
+                        .h(px(DROP_ITEM_H))
+                        .flex_shrink_0()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .child(format!("\\{name}"));
                     if i == selected {
                         row.bg(theme.accent_bg).text_color(theme.accent)
                     } else {
@@ -938,15 +942,19 @@ impl Render for MathEditor {
 
             // Scrollbar thumb, shown only when the rows overflow the cap — sized from the
             // content height + positioned from the live offset (mirrors the host slash menu).
-            let rows_h = matches.len() as f32 * DROP_ITEM_H;
-            let thumb = (rows_h > DROP_MAX_H).then(|| {
-                let scrolled =
-                    (-f32::from(self.match_scroll.offset().y)).clamp(0.0, rows_h - DROP_MAX_H);
-                let thumb_h = (DROP_MAX_H * DROP_MAX_H / rows_h).max(24.0);
-                let thumb_top = scrolled / (rows_h - DROP_MAX_H) * (DROP_MAX_H - thumb_h);
+            // All MEASURED (last frame's bounds/content): estimating content height
+            // as rows × DROP_ITEM_H drifted from the paint, leaving the thumb short
+            // of the bottom on a fully-scrolled list. `max_offset` is content − view.
+            let vh = f32::from(self.match_scroll.bounds().size.height);
+            let max_scroll = f32::from(self.match_scroll.max_offset().y);
+            let thumb = (vh > 0.0 && max_scroll > 0.0).then(|| {
+                let scrolled = (-f32::from(self.match_scroll.offset().y)).clamp(0.0, max_scroll);
+                let thumb_h = (vh * vh / (vh + max_scroll)).max(24.0);
+                let thumb_top = scrolled / max_scroll * (vh - thumb_h);
                 let mut thumb_c = theme.muted;
                 thumb_c.a = 0.5;
                 div()
+                    .id("ratex-cmd-thumb")
                     .absolute()
                     .top(px(thumb_top))
                     .right(px(2.0))
@@ -954,6 +962,22 @@ impl Render for MathEditor {
                     .h(px(thumb_h))
                     .rounded(px(3.0))
                     .bg(thumb_c)
+                    .cursor_pointer()
+                    // Draggable: grab records (mouse y, scrolled-at-grab); the root's
+                    // on_drag_move maps the delta back to a scroll offset (same
+                    // GripDrag machinery as the palette).
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                            this.thumb_drag = Some((f32::from(ev.position.y), scrolled));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_drag(GripDrag, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| GripDrag)
+                    })
             });
 
             Some(
@@ -968,6 +992,10 @@ impl Render for MathEditor {
                     .rounded_md()
                     .overflow_hidden()
                     .text_size(px(14.0))
+                    // An absolute container offers min-content width, which wraps a
+                    // command name to one glyph per line — keep rows on one line so
+                    // the panel sizes to its longest match.
+                    .whitespace_nowrap()
                     .child(viewport)
                     .children(thumb),
             )
@@ -1014,6 +1042,20 @@ impl Render for MathEditor {
                         this.toolbar_off.1 += my - ly;
                         this.toolbar_drag = Some((mx, my));
                         cx.notify();
+                    } else if let Some((gy, scrolled_at_grab)) = this.thumb_drag {
+                        // Thumb-drag → scroll offset: a thumb pixel covers
+                        // max_scroll / (vh − thumb_h) content pixels. Same MEASURED
+                        // quantities the thumb render derives, so they stay in step.
+                        let vh = f32::from(this.match_scroll.bounds().size.height);
+                        let max_scroll = f32::from(this.match_scroll.max_offset().y);
+                        let thumb_h = (vh * vh / (vh + max_scroll)).max(24.0);
+                        if max_scroll > 0.0 && vh > thumb_h {
+                            let scrolled = (scrolled_at_grab
+                                + (my - gy) * max_scroll / (vh - thumb_h))
+                                .clamp(0.0, max_scroll);
+                            this.match_scroll.set_offset(point(px(0.0), px(-scrolled)));
+                            cx.notify();
+                        }
                     }
                 }),
             )
@@ -1022,6 +1064,7 @@ impl Render for MathEditor {
                 cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                     let dragged = this.palette_drag.take().is_some();
                     let dragged = this.toolbar_drag.take().is_some() || dragged;
+                    let dragged = this.thumb_drag.take().is_some() || dragged;
                     if dragged {
                         cx.notify();
                     }
@@ -1093,17 +1136,17 @@ impl Render for MathEditor {
                     .children(image)
                     .children(caret)
                     .children(pending)
-                    // Deferred: the dropdown floats below the caret, often past
-                    // the host's reserved gap — without deferral, later-painted
-                    // siblings (the next journal day) draw over it.
-                    .children(dropdown.map(deferred))
                     // In-line palette + matrix toolbar live in the container, so they track the
                     // formula's centered / right-aligned position automatically.
-                    // Deferred like the dropdown: both panels float outside the
-                    // reserved gap (palette below the formula, toolbar under a
-                    // matrix) and must paint above the host's later content.
+                    // Deferred: both panels float outside the reserved gap (palette
+                    // below the formula, toolbar under a matrix) and must paint above
+                    // the host's later content.
                     .children(inner_palette.map(deferred))
-                    .children(self.matrix_toolbar(cx).map(deferred)),
+                    .children(self.matrix_toolbar(cx).map(deferred))
+                    // Deferred like the panels, and painted LAST: the dropdown floats
+                    // below the caret, often past the reserved gap and over the
+                    // palette (#77) — it must win both overlaps.
+                    .children(dropdown.map(deferred)),
             )
     }
 }
