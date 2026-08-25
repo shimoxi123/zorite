@@ -82,7 +82,7 @@ The surface splits into three layers, documented in this order:
 | [`editor::input::commit_command_selecting`](#commit_command_selecting) | fn | `editor` | `fn commit_command_selecting(top: &mut Row, cursor: &mut Cursor, name: &str, sel: Option<(usize, usize)>) -> bool` | Same, wrapping a selection when the command can |
 | [`editor::input::delim_pair`](#delim_pair) | fn | `editor` | `fn delim_pair(c: char) -> Option<(&'static str, &'static str)>` | The `(open, close)` pair a typed bracket wraps with |
 | [`editor::input::command_matches`](#command_matches) | fn | `editor` | `fn command_matches(prefix: &str) -> Vec<&'static str>` | Autocomplete: command names starting with a prefix |
-| [`editor::input::PALETTE`](#const-palette) | const | `editor` | `const PALETTE: &[(&str, &str)]` | The 40-button click-to-insert palette (glyph, command) |
+| [`editor::input::PALETTE`](#const-palette) | const | `editor` | `const PALETTE: &[(&str, &str)]` | The 45-button click-to-insert palette (glyph, command) |
 | [`MathEditor`](#struct-matheditor) | struct | `editor` | — | The interactive gpui editor view. Re-exported at the crate root; lives in `editor::view` |
 | [`MathEditor::new`](#matheditornew) | constructor | `editor` | `fn new(cx: &mut Context<Self>) -> Self` | An empty standalone editor (48 px/em, floating palette) |
 | [`MathEditor::from_latex`](#matheditorfrom_latex) | constructor | `editor` | `fn from_latex(latex: &str, font_size: f32, at_end: bool, align: MathAlign, theme: MathTheme, cx: &mut Context<Self>) -> Self` | An in-line editor seeded from LaTeX |

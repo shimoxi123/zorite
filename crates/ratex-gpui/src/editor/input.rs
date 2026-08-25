@@ -342,6 +342,8 @@ pub const PALETTE: &[(&str, &str)] = &[
     ("≤", "le"),     ("≥", "ge"),      ("≠", "ne"),     ("≈", "approx"),
     ("×", "times"),  ("÷", "div"),     ("·", "cdot"),   ("±", "pm"),
     ("→", "to"),     ("∂", "partial"), ("∇", "nabla"),  ("∈", "in"),
+    // accents — wrap the selection, or insert an empty base (#77)
+    ("x\u{302}", "hat"), ("x\u{304}", "bar"), ("x\u{20D7}", "vec"), ("x\u{303}", "tilde"), ("x\u{307}", "dot"),
 ];
 
 #[cfg(test)]

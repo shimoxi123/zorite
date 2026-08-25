@@ -135,11 +135,11 @@ impl Render for SelectDrag {
         gpui::Empty
     }
 }
-/// The palette panel's full height: 40 buttons wrap to 8 rows at this width
+/// The palette panel's full height: 45 buttons wrap to 9 rows at this width
 /// (32px + 4px gap), plus padding and the drag handle. Used to flip the
 /// panel above the formula when the below-dock would clip at the window
 /// bottom — an estimate is fine, it only steers the flip.
-const PALETTE_H: f32 = 330.0;
+const PALETTE_H: f32 = 366.0;
 
 /// Cap on the formula's in-place undo history, to bound memory.
 const UNDO_CAP: usize = 200;
