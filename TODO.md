@@ -324,7 +324,7 @@ Follow-ups from reviewing #70 (fixed in the branch that follows it):
 Crate-internal defects and API hygiene, mostly surfaced by the 2026-07-06
 public-API audit (every crate now carries a complete `API.md`; these are the
 findings worth fixing rather than just documenting):
-- [ ] `ratex-gpui`: **accents in the structural editor** (#77 — can't type
+- [x] `ratex-gpui`: **accents in the structural editor** (#77 — can't type
   `$\hat{X}$`). Three gaps, scoped 2026-08-25:
   1. `Atom::Accent { accent, base }` — model + `to_latex` + parser mapping
      (`ParseNode::Accent` currently *degrades to its inner content*, so
@@ -339,6 +339,9 @@ findings worth fixing rather than just documenting):
      `(`; `}` hops out mirroring `)`. ~10 lines; ships independently.
   3. Escape `{`/`}` (and other TeX-active chars) in `Sym` serialization so
      a stray brace can never emit invalid source. Falls out of 2; add a test.
+  **SHIPPED 2026-08-25 (PR #81)** — plus dropdown UX, drag-selection,
+  selection-wrap on `\command`, palette accent row, and the first-line-block
+  up-arrow guard found in live testing.
 - [ ] `ratex-gpui`: **duplicate `"angle"` command** in the `input.rs` `COMMANDS`
   table — the ⟨⟩ delimiter pair shadows the `\angle` symbol entry (first-match
   lookup), so the symbol is unreachable by name; rename one (e.g. `langle`
