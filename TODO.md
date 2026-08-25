@@ -298,6 +298,24 @@ Follow-ups from reviewing #70 (fixed in the branch that follows it):
   engine, and slash-command search matches localized labels only — the plan
   wants English aliases to keep working too.
 
+**RTL UI locale readiness** (scoped 2026-08-25 — content RTL shipped in #66;
+this is about the CHROME, if an Arabic/Hebrew/Persian locale ever lands):
+- [ ] **Wait for a native-speaker contribution** for the strings, the zh-CN
+  model (#70) — don't machine-translate. The rust-i18n side is just another
+  yml; QA needs a speaker.
+- [ ] **Locale-driven sidebar default** — an RTL locale should default
+  `sidebar_right` on (the setting shipped 2026-08-25, commit `f154d9f`);
+  user's explicit choice still wins.
+- [ ] **Chrome-mirroring inventory** — gpui-component has no RTL layout mode,
+  so mirroring is hand-rolled per surface like the sidebar was: menus and
+  popover anchors, dialog button order, tab strip direction, settings nav +
+  card layout, chevrons/carets, find bars, paddings that assume LTR reading.
+  Translated strings in LTR layouts is a shippable half-measure; decide how
+  far to go only when a real locale exists.
+- [ ] Labels/buttons render RTL strings as single shaped runs — spot-check a
+  few chrome surfaces with Arabic text before promising anything (the #66
+  work was editor/reader-only; plain gpui labels are believed fine).
+
 ## App & polish
 - [ ] **Graph-node context menu** — nodes hit-test inside one
   canvas element (`g.hit(position)`), so the shared page-menu builder
