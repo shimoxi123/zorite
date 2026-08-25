@@ -103,6 +103,7 @@ fn slot_model_row(atom: &Atom, slot: Slot) -> Option<&Row> {
         (Atom::Sqrt { radicand, .. }, Slot::Radicand) => Some(radicand),
         (Atom::Sqrt { index: Some(i), .. }, Slot::Index) => Some(i),
         (Atom::Delim { body, .. }, Slot::Body) => Some(body),
+        (Atom::Accent { base, .. }, Slot::Base) => Some(base),
         (Atom::SupSub { sub: Some(r), .. }, Slot::Sub) => Some(r),
         (Atom::SupSub { sup: Some(r), .. }, Slot::Sup) => Some(r),
         (Atom::Matrix { rows }, Slot::Cell(r, c)) => rows.get(r).and_then(|row| row.get(c)),
@@ -262,6 +263,9 @@ fn descend(
         (BoxContent::LeftRight { left, inner, .. }, Slot::Body) => {
             Some((&**inner, x + left.width * scale, y, scale))
         }
+        // Accent base: `to_display` emits the base at the accent box's own origin
+        // (the mark floats above it), so the base inherits (x, y, scale) unchanged.
+        (BoxContent::Accent { base, .. }, Slot::Base) => Some((&**base, x, y, scale)),
         // Square-root radicand: right of the surd glyph.
         (BoxContent::Radical { body, .. }, Slot::Radicand) => {
             Some((&**body, x + (boxx.width - body.width) * scale, y, scale))

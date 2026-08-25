@@ -66,6 +66,7 @@ The surface splits into three layers, documented in this order:
 | [`Cursor::matrix_remove_col`](#matrix-row--column-editing) | method | `editor` | `fn matrix_remove_col(&mut self, top: &mut Row)` | Remove the caret's matrix column (last column is kept) |
 | [`Cursor::delete_range`](#cursordelete_range) | method | `editor` | `fn delete_range(&mut self, top: &mut Row, lo: usize, hi: usize)` | Delete a selection (atom range) in the cursor's row |
 | [`Cursor::wrap_delim`](#the-wrap_-methods) | method | `editor` | `fn wrap_delim(&mut self, top: &mut Row, lo: usize, hi: usize, open: &str, close: &str)` | Wrap a selection in `\left…\right` delimiters |
+| [`Cursor::wrap_accent`](#the-wrap_-methods) | method | `editor` | `fn wrap_accent(&mut self, top: &mut Row, lo: usize, hi: usize, accent: &str)` | Wrap a selection under an accent (`\hat`, `\bar`, …) |
 | [`Cursor::wrap_sqrt`](#the-wrap_-methods) | method | `editor` | `fn wrap_sqrt(&mut self, top: &mut Row, lo: usize, hi: usize)` | Wrap a selection under a square root |
 | [`Cursor::wrap_nth_root`](#the-wrap_-methods) | method | `editor` | `fn wrap_nth_root(&mut self, top: &mut Row, lo: usize, hi: usize)` | Wrap under an nth-root; caret into the degree box |
 | [`Cursor::wrap_fraction`](#the-wrap_-methods) | method | `editor` | `fn wrap_fraction(&mut self, top: &mut Row, lo: usize, hi: usize)` | Selection → numerator; caret into the denominator |
@@ -81,7 +82,7 @@ The surface splits into three layers, documented in this order:
 | [`editor::input::commit_command_selecting`](#commit_command_selecting) | fn | `editor` | `fn commit_command_selecting(top: &mut Row, cursor: &mut Cursor, name: &str, sel: Option<(usize, usize)>) -> bool` | Same, wrapping a selection when the command can |
 | [`editor::input::delim_pair`](#delim_pair) | fn | `editor` | `fn delim_pair(c: char) -> Option<(&'static str, &'static str)>` | The `(open, close)` pair a typed bracket wraps with |
 | [`editor::input::command_matches`](#command_matches) | fn | `editor` | `fn command_matches(prefix: &str) -> Vec<&'static str>` | Autocomplete: command names starting with a prefix |
-| [`editor::input::PALETTE`](#const-palette) | const | `editor` | `const PALETTE: &[(&str, &str)]` | The 40-button click-to-insert palette (glyph, command) |
+| [`editor::input::PALETTE`](#const-palette) | const | `editor` | `const PALETTE: &[(&str, &str)]` | The 45-button click-to-insert palette (glyph, command) |
 | [`MathEditor`](#struct-matheditor) | struct | `editor` | — | The interactive gpui editor view. Re-exported at the crate root; lives in `editor::view` |
 | [`MathEditor::new`](#matheditornew) | constructor | `editor` | `fn new(cx: &mut Context<Self>) -> Self` | An empty standalone editor (48 px/em, floating palette) |
 | [`MathEditor::from_latex`](#matheditorfrom_latex) | constructor | `editor` | `fn from_latex(latex: &str, font_size: f32, at_end: bool, align: MathAlign, theme: MathTheme, cx: &mut Context<Self>) -> Self` | An in-line editor seeded from LaTeX |
@@ -347,6 +348,8 @@ pub enum Atom {
     SupSub { sup: Option<Row>, sub: Option<Row> },
     /// \sqrt{radicand} or \sqrt[index]{radicand}.
     Sqrt { radicand: Row, index: Option<Row> },
+    /// An accent over an editable base: \hat{base}, \bar{base}, \vec{base}, ….
+    Accent { accent: String, base: Row },
     /// Auto-growing delimiters: \left<open> body \right<close>.
     Delim { open: String, body: Row, close: String },
     /// A matrix: a rectangular grid of cells (rows[r][c]), rendered with parentheses.
@@ -446,6 +449,7 @@ pub enum Slot {
     Radicand,          // root body
     Index,             // nth-root degree
     Body,              // delimiter body
+    Base,              // accent base
     Sup,               // superscript
     Sub,               // subscript
     Cell(usize, usize) // matrix cell at (row, column)
@@ -623,6 +627,7 @@ at `lo`.
 
 ```rust
 pub fn wrap_delim(&mut self, top: &mut Row, lo: usize, hi: usize, open: &str, close: &str)
+pub fn wrap_accent(&mut self, top: &mut Row, lo: usize, hi: usize, accent: &str)
 pub fn wrap_sqrt(&mut self, top: &mut Row, lo: usize, hi: usize)
 pub fn wrap_nth_root(&mut self, top: &mut Row, lo: usize, hi: usize)
 pub fn wrap_fraction(&mut self, top: &mut Row, lo: usize, hi: usize)
@@ -633,6 +638,7 @@ Replace atoms `lo..hi` of the cursor's row with **one structure containing them*
 | Method | Selection becomes | Caret lands |
 | --- | --- | --- |
 | `wrap_delim` | the delimiter's body (`\left<open> … \right<close>`) | just **after** the delimiter |
+| `wrap_accent` | the accent's base (`accent` is the command, e.g. `r"\hat"`) | just **after** the accent |
 | `wrap_sqrt` | the radicand | just **after** the root |
 | `wrap_nth_root` | the radicand (an empty degree box is added) | **inside the degree**, ready to type e.g. `3` |
 | `wrap_fraction` | the numerator (denominator starts empty) | **inside the denominator** |
@@ -910,7 +916,7 @@ commit the view actually calls.
 
 - With a selection, a **wrap-capable** command wraps it instead of inserting empty:
   `frac` → [`wrap_fraction`](#the-wrap_-methods), `sqrt` → `wrap_sqrt`, `nthroot` →
-  `wrap_nth_root`, any delimiter → `wrap_delim`. (Returns `true` even if the range was
+  `wrap_nth_root`, any delimiter → `wrap_delim`, any accent → `wrap_accent`. (Returns `true` even if the range was
   empty/out-of-bounds and the wrap no-opped.)
 - Every other command — and any command with `sel: None` — is plain
   `commit_command`: it inserts at the caret, leaving the selection's atoms in place

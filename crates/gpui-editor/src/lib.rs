@@ -994,6 +994,11 @@ struct EditingBlock {
 struct EditingInline {
     range: Range<usize>,
     view: gpui::AnyView,
+    /// Where the view's top-left sits relative to the formula raster's top-left. The
+    /// host's editor view pads its raster differently than the display raster (whose
+    /// padding was baked at the block em and scaled down), so a zero offset shifts
+    /// the glyphs visibly on entering edit.
+    offset: Point<Pixels>,
 }
 
 impl EditorState {
@@ -1399,6 +1404,13 @@ impl EditorState {
         cx.notify();
     }
 
+    /// The byte range of the block currently being structurally edited (the range handed
+    /// to [`Self::set_editing_block`] — the source text is untouched while the edit is
+    /// open, so it stays valid). `None` when no block edit is open.
+    pub fn editing_block_range(&self) -> Option<Range<usize>> {
+        self.editing_block.as_ref().map(|eb| eb.range.clone())
+    }
+
     /// End an in-line math edit (the host has committed / cancelled). Returns the block's
     /// byte range, so the host can overwrite it.
     pub fn end_editing_block(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
@@ -1409,13 +1421,20 @@ impl EditorState {
 
     /// Begin a structural edit of the inline `$…$` span at `range` (absolute bytes): overlay
     /// `view` (the host's editor) at the formula's painted spot. The host focuses `view`.
+    /// `offset` places the view relative to the raster's top-left, letting the host
+    /// align the view's glyphs with the displayed formula's (their paddings differ).
     pub fn set_editing_inline(
         &mut self,
         range: Range<usize>,
         view: gpui::AnyView,
+        offset: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.editing_inline = Some(EditingInline { range, view });
+        self.editing_inline = Some(EditingInline {
+            range,
+            view,
+            offset,
+        });
         cx.notify();
     }
 
@@ -1615,8 +1634,8 @@ impl EditorState {
         Some(
             div()
                 .absolute()
-                .top(rect.origin.y - origin.y)
-                .left(rect.origin.x - origin.x)
+                .top(rect.origin.y - origin.y + ei.offset.y)
+                .left(rect.origin.x - origin.x + ei.offset.x)
                 .occlude()
                 .child(ei.view.clone()),
         )
@@ -1816,7 +1835,22 @@ impl EditorState {
         if visual_right {
             self.next_visible_boundary(off)
         } else {
-            self.prev_visible_boundary(off)
+            let target = self.prev_visible_boundary(off);
+            // Same nudge as the bidi branch above: a leftward step over a formula's
+            // spacer resolves to the span's START, which fails `left()`'s strictly-
+            // inside test — so on plain LTR rows the editor never opened from the
+            // right and the caret just seated at the formula's start (#77).
+            let (trow, _) = self.row_col(target);
+            let line_start = self.line_starts()[trow];
+            let here = off.saturating_sub(line_start);
+            let lands_on_a_formula = markdown_syntax::inline_math_spans(self.line_str(trow))
+                .into_iter()
+                .any(|s| line_start + s.start == target && !(s.start < here && here < s.end));
+            if lands_on_a_formula {
+                target + 1
+            } else {
+                target
+            }
         }
     }
 
@@ -2719,10 +2753,24 @@ impl EditorState {
         // report no math block here — clicks / arrows / `/math` stay in the text editor.
         self.markdown_style.as_ref()?;
         let starts = self.line_starts();
-        markdown_syntax::math_blocks(&self.content)
-            .into_iter()
+        let blocks = markdown_syntax::math_blocks(&self.content);
+        blocks
+            .iter()
             .find(|(r, _)| r.contains(&row))
-            .map(|(r, source)| (starts[r.start]..self.line_end(r.end - 1), source.into()))
+            .or_else(|| {
+                // A `<!-- math:ALIGN -->` marker row belongs to the block directly
+                // below it: it's invisible in WYSIWYG, so a caret seated there —
+                // e.g. arrow-up returns offset 0 when the block opens the document
+                // (#77) — would reveal the raw rows instead of opening the editor.
+                markdown_syntax::math_align_marker(self.line_str(row))?;
+                blocks.iter().find(|(r, _)| r.start == row + 1)
+            })
+            .map(|(r, source)| {
+                (
+                    starts[r.start]..self.line_end(r.end - 1),
+                    source.clone().into(),
+                )
+            })
     }
 
     /// A `$$` block's byte range grown for deletion: takes in the
@@ -4064,11 +4112,13 @@ impl EditorState {
             }
         } else {
             let (start_row, _) = self.row_col(block.start);
-            if start_row > 0 {
-                self.line_end(start_row - 1)
-            } else {
-                0
+            // An alignment marker directly above belongs to the block — resting
+            // on it reveals the region, so step past it too.
+            let mut row = start_row;
+            if row > 0 && markdown_syntax::math_align_marker(self.line_str(row - 1)).is_some() {
+                row -= 1;
             }
+            if row > 0 { self.line_end(row - 1) } else { 0 }
         };
         self.move_to(target, cx);
     }

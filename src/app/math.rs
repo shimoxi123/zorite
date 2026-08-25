@@ -224,8 +224,19 @@ impl AppView {
         // Seat the editor: an inline `$…$` overlays the formula's spot (surrounding text stays
         // put); a `$$` block reserves a full-width gap at its row, sized to the cached render.
         if inline {
+            // Align the editor's glyphs with the displayed formula's: the editor pads
+            // its raster PAD px at text size, but the display raster's PAD was baked
+            // at the block em (FONT_SIZE) and scaled down — without compensation the
+            // formula shifts down/right by the difference on entering edit (#77).
+            let pad_delta =
+                ratex_gpui::render::PAD * (self.text_size / crate::math::FONT_SIZE - 1.0);
             source.update(cx, |e, cx| {
-                e.set_editing_inline(range, editor.clone().into(), cx)
+                e.set_editing_inline(
+                    range,
+                    editor.clone().into(),
+                    gpui::point(gpui::px(pad_delta), gpui::px(pad_delta)),
+                    cx,
+                )
             });
         } else {
             let height = self
@@ -416,6 +427,20 @@ impl AppView {
     /// same line; a `$$` block seats it on the adjacent line.
     fn exit_math_edit(&mut self, after: bool, window: &mut Window, cx: &mut Context<Self>) {
         let inline = self.math_edit.as_ref().is_some_and(|m| m.inline);
+        // A `$$` block with nothing above it (document start, or only its own
+        // `<!-- math:ALIGN -->` marker): exiting "before" would seat the text caret
+        // on the opening fence row and reveal the raw source — stay in the formula.
+        if !after
+            && !inline
+            && let Some(edit) = self.math_edit.as_ref()
+            && let Some(range) = edit.source.read(cx).editing_block_range()
+        {
+            let text = edit.source.read(cx).value();
+            let above = text[..range.start.min(text.len())].trim_end_matches('\n');
+            if above.is_empty() || (!above.contains('\n') && above.starts_with("<!-- math:")) {
+                return;
+            }
+        }
         if let Some((source, block)) = self.commit_math_edit(cx) {
             // ratex-gpui reports the arrow it was handed — left/up = before the
             // span, right/down = after — which is the left-to-right reading. On

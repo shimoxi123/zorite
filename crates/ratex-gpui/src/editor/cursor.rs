@@ -20,6 +20,8 @@ pub enum Slot {
     Radicand,
     Index,
     Body,
+    /// An accent's base row.
+    Base,
     Sup,
     Sub,
     /// A matrix cell at (row, column).
@@ -52,6 +54,7 @@ pub(crate) fn nav_slots(atom: &Atom) -> Vec<Slot> {
             }
         }
         Atom::Delim { .. } => vec![Slot::Body],
+        Atom::Accent { .. } => vec![Slot::Base],
         Atom::Matrix { rows } => (0..rows.len())
             .flat_map(|r| (0..rows[r].len()).map(move |c| Slot::Cell(r, c)))
             .collect(),
@@ -77,6 +80,7 @@ fn slot_row(atom: &Atom, slot: Slot) -> &Row {
         (Atom::Sqrt { radicand, .. }, Slot::Radicand) => radicand,
         (Atom::Sqrt { index: Some(i), .. }, Slot::Index) => i,
         (Atom::Delim { body, .. }, Slot::Body) => body,
+        (Atom::Accent { base, .. }, Slot::Base) => base,
         (Atom::SupSub { sub: Some(r), .. }, Slot::Sub) => r,
         (Atom::SupSub { sup: Some(r), .. }, Slot::Sup) => r,
         (Atom::Matrix { rows }, Slot::Cell(r, c)) => &rows[r][c],
@@ -91,6 +95,7 @@ fn slot_row_mut(atom: &mut Atom, slot: Slot) -> &mut Row {
         (Atom::Sqrt { radicand, .. }, Slot::Radicand) => radicand,
         (Atom::Sqrt { index: Some(i), .. }, Slot::Index) => i,
         (Atom::Delim { body, .. }, Slot::Body) => body,
+        (Atom::Accent { base, .. }, Slot::Base) => base,
         (Atom::SupSub { sub: Some(r), .. }, Slot::Sub) => r,
         (Atom::SupSub { sup: Some(r), .. }, Slot::Sup) => r,
         (Atom::Matrix { rows }, Slot::Cell(r, c)) => &mut rows[r][c],
@@ -111,6 +116,43 @@ fn resolve_mut<'a>(row: &'a mut Row, path: &[Step]) -> &'a mut Row {
     match path.split_first() {
         None => row,
         Some((step, rest)) => resolve_mut(slot_row_mut(&mut row.atoms[step.atom], step.slot), rest),
+    }
+}
+
+/// Collapse two positions into a selection in their deepest COMMON row: each end
+/// climbs out of any structure the other doesn't share, taking that structure in
+/// whole (MathQuill's drag-selection semantics). Returns `(row_path, lo, hi)`;
+/// `lo == hi` when both ends resolve to the same spot.
+pub fn common_row_selection(a: &Cursor, b: &Cursor) -> (Vec<Step>, usize, usize) {
+    let common = a
+        .path
+        .iter()
+        .zip(b.path.iter())
+        .take_while(|(x, y)| x == y)
+        .count();
+    // Each end's position at the common depth: the atom of the structure it's still
+    // inside, or its own index when it lives in the common row.
+    let pos = |c: &Cursor| c.path.get(common).map(|s| s.atom).unwrap_or(c.index);
+    let (pa, pb) = (pos(a), pos(b));
+    let path = a.path[..common].to_vec();
+    if a.path.len() > common && b.path.len() > common && pa == pb {
+        // Both inside the same structure but on divergent branches (e.g. a
+        // fraction's num vs den): the selection is that structure, whole.
+        return (path, pa, pa + 1);
+    }
+    // The left end includes its structure from its left edge (the atom itself);
+    // the right end includes through its right edge (atom + 1).
+    let edge = |c: &Cursor, p: usize, rightward: bool| {
+        if c.path.len() > common {
+            if rightward { p + 1 } else { p }
+        } else {
+            c.index
+        }
+    };
+    if pa <= pb {
+        (path, edge(a, pa, false), edge(b, pb, true))
+    } else {
+        (path, edge(b, pb, false), edge(a, pa, true))
     }
 }
 
@@ -142,12 +184,23 @@ impl Cursor {
         }
     }
 
-    /// Delete the atom before the cursor. At a slot start, ascend out to before the
-    /// structure (deleting an empty structure outright is a later refinement).
+    /// Delete the atom before the cursor. An accent peels — the wrapper goes, its base
+    /// stays in place (`\hat{x}` → `x`, MathQuill's convention) — since the base is
+    /// user content a plain remove would silently destroy. At a slot start, ascend out
+    /// to before the structure (deleting an empty structure outright is a later
+    /// refinement).
     pub fn backspace(&mut self, top: &mut Row) {
         if self.index > 0 {
-            resolve_mut(top, &self.path).atoms.remove(self.index - 1);
-            self.index -= 1;
+            let row = resolve_mut(top, &self.path);
+            let at = self.index - 1;
+            if let Atom::Accent { base, .. } = &mut row.atoms[at] {
+                let inner = std::mem::take(&mut base.atoms);
+                self.index = at + inner.len();
+                row.atoms.splice(at..=at, inner);
+            } else {
+                row.atoms.remove(at);
+                self.index = at;
+            }
         } else if let Some(step) = self.path.pop() {
             self.index = step.atom;
         }
@@ -379,6 +432,17 @@ impl Cursor {
             open: open.to_string(),
             body,
             close: close.to_string(),
+        }) {
+            self.index = at + 1;
+        }
+    }
+
+    /// Wrap a selection (`lo..hi`) under an accent (`\hat`, `\bar`, …) — the selection
+    /// becomes the base. Caret lands just after the accent.
+    pub fn wrap_accent(&mut self, top: &mut Row, lo: usize, hi: usize, accent: &str) {
+        if let Some(at) = self.wrap_range(top, lo, hi, |base| Atom::Accent {
+            accent: accent.to_string(),
+            base,
         }) {
             self.index = at + 1;
         }
@@ -634,6 +698,110 @@ mod tests {
         cur.move_right(&top); // sup end -> out after the script
         assert_eq!(cur.path, vec![]);
         assert_eq!(cur.index, 2);
+    }
+
+    #[test]
+    fn accent_descend_type_and_exit() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        cur.insert(
+            &mut top,
+            Atom::Accent {
+                accent: r"\hat".into(),
+                base: Row::new(),
+            },
+        );
+        // insert descends into the base slot
+        assert_eq!(
+            cur.path,
+            vec![Step {
+                atom: 0,
+                slot: Slot::Base
+            }]
+        );
+        cur.insert(&mut top, sym("X"));
+        assert_eq!(top.to_latex(), r"\hat{X}");
+        cur.move_right(&top); // base end -> out after the accent
+        assert_eq!(cur.path, vec![]);
+        assert_eq!(cur.index, 1);
+    }
+
+    #[test]
+    fn common_row_selection_reconciles_divergent_ends() {
+        let step = |atom, slot| Step { atom, slot };
+        // Ends inside two different structures of the top row: both climb out,
+        // each structure taken whole (atoms 1 and 3 → 1..4).
+        let a = Cursor {
+            path: vec![step(1, Slot::Base)],
+            index: 0,
+        };
+        let b = Cursor {
+            path: vec![step(3, Slot::Base)],
+            index: 1,
+        };
+        assert_eq!(common_row_selection(&a, &b), (vec![], 1, 4));
+        // Order-independent.
+        assert_eq!(common_row_selection(&b, &a), (vec![], 1, 4));
+        // One end deep, one in the row: the structure is included whole.
+        let c = Cursor {
+            path: vec![],
+            index: 0,
+        };
+        assert_eq!(common_row_selection(&c, &a), (vec![], 0, 2));
+        // Divergent branches of the SAME structure select just that structure.
+        let n = Cursor {
+            path: vec![step(2, Slot::Num)],
+            index: 0,
+        };
+        let d = Cursor {
+            path: vec![step(2, Slot::Den)],
+            index: 1,
+        };
+        assert_eq!(common_row_selection(&n, &d), (vec![], 2, 3));
+        // Both in one nested row: a plain range there.
+        let e = Cursor {
+            path: vec![step(2, Slot::Num)],
+            index: 2,
+        };
+        assert_eq!(
+            common_row_selection(&n, &e),
+            (vec![step(2, Slot::Num)], 0, 2)
+        );
+    }
+
+    #[test]
+    fn backspace_after_accent_peels_the_wrapper() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        cur.insert(
+            &mut top,
+            Atom::Accent {
+                accent: r"\hat".into(),
+                base: Row::new(),
+            },
+        ); // descends into the base
+        cur.insert(&mut top, sym("x"));
+        cur.insert(&mut top, sym("y"));
+        cur.move_right(&top); // base end -> out, after the accent
+        assert_eq!(top.to_latex(), r"\hat{x y}");
+        assert_eq!((cur.path.clone(), cur.index), (vec![], 1));
+        cur.backspace(&mut top); // peel: the base stays, the hat goes
+        assert_eq!(top.to_latex(), "x y");
+        assert_eq!(cur.index, 2);
+        cur.backspace(&mut top); // plain delete resumes
+        assert_eq!(top.to_latex(), "x");
+    }
+
+    #[test]
+    fn wrap_accent_wraps_a_range_caret_after() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        for c in ["x", "y"] {
+            cur.insert(&mut top, sym(c));
+        }
+        cur.wrap_accent(&mut top, 0, 2, r"\bar");
+        assert_eq!(top.to_latex(), r"\bar{x y}");
+        assert_eq!(cur.index, 1);
     }
 
     #[test]
