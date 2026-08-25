@@ -506,6 +506,33 @@ jobs:
       - name: Build .deb + .AppImage
         run: cargo packager --release -f deb -f appimage
 
+      # Delta updates (#74): cargo-packager has no update-information
+      # support, so re-pack the AppImage with appimagetool. `-u` embeds
+      # the update info in the `.upd_info` ELF section (recognized by
+      # AppImageUpdate / AppImageLauncher / AM) and writes the matching
+      # `.zsync` next to the output; running it against the FINAL asset
+      # filename keeps the zsync's `Filename:` header correct. The
+      # `gh-releases-zsync` transport resolves `latest` via the GitHub
+      # API, so the version part of the glob stays a wildcard.
+      # appimagetool only publishes a `continuous` tag — no version to
+      # pin; it runs on the extracted AppDir linuxdeploy already built.
+      - name: Embed AppImage update information + .zsync
+        run: |
+          VERSION="${EFFECTIVE_VERSION#v}"
+          ARCH="${{ matrix.rpm_arch }}"
+          NAME="zorite_${VERSION}_${ARCH}.AppImage"
+
+          curl -fsSL -o appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+          chmod +x appimagetool
+          TOOL="$PWD/appimagetool"
+
+          cd target/release
+          "./$NAME" --appimage-extract >/dev/null
+          UPDINFO="gh-releases-zsync|packetThrower|zorite|latest|zorite_*_${ARCH}.AppImage.zsync"
+          ARCH="$ARCH" "$TOOL" -u "$UPDINFO" squashfs-root "$NAME"
+          test -f "${NAME}.zsync"
+
       - name: Build .rpm via fpm
         run: |
           VERSION="${EFFECTIVE_VERSION#v}"
@@ -593,6 +620,7 @@ jobs:
           # Zorite_<version>_<arch>.<format>.
           cp "$BUNDLE"/*.deb release-artifacts/ 2>/dev/null || true
           cp "$BUNDLE"/*.AppImage release-artifacts/ 2>/dev/null || true
+          cp "$BUNDLE"/*.AppImage.zsync release-artifacts/ 2>/dev/null || true
 
           echo "--- staged ---"
           ls -la release-artifacts/
