@@ -147,12 +147,23 @@ impl Cursor {
         }
     }
 
-    /// Delete the atom before the cursor. At a slot start, ascend out to before the
-    /// structure (deleting an empty structure outright is a later refinement).
+    /// Delete the atom before the cursor. An accent peels — the wrapper goes, its base
+    /// stays in place (`\hat{x}` → `x`, MathQuill's convention) — since the base is
+    /// user content a plain remove would silently destroy. At a slot start, ascend out
+    /// to before the structure (deleting an empty structure outright is a later
+    /// refinement).
     pub fn backspace(&mut self, top: &mut Row) {
         if self.index > 0 {
-            resolve_mut(top, &self.path).atoms.remove(self.index - 1);
-            self.index -= 1;
+            let row = resolve_mut(top, &self.path);
+            let at = self.index - 1;
+            if let Atom::Accent { base, .. } = &mut row.atoms[at] {
+                let inner = std::mem::take(&mut base.atoms);
+                self.index = at + inner.len();
+                row.atoms.splice(at..=at, inner);
+            } else {
+                row.atoms.remove(at);
+                self.index = at;
+            }
         } else if let Some(step) = self.path.pop() {
             self.index = step.atom;
         }
@@ -676,6 +687,29 @@ mod tests {
         cur.move_right(&top); // base end -> out after the accent
         assert_eq!(cur.path, vec![]);
         assert_eq!(cur.index, 1);
+    }
+
+    #[test]
+    fn backspace_after_accent_peels_the_wrapper() {
+        let mut top = Row::new();
+        let mut cur = Cursor::start();
+        cur.insert(
+            &mut top,
+            Atom::Accent {
+                accent: r"\hat".into(),
+                base: Row::new(),
+            },
+        ); // descends into the base
+        cur.insert(&mut top, sym("x"));
+        cur.insert(&mut top, sym("y"));
+        cur.move_right(&top); // base end -> out, after the accent
+        assert_eq!(top.to_latex(), r"\hat{x y}");
+        assert_eq!((cur.path.clone(), cur.index), (vec![], 1));
+        cur.backspace(&mut top); // peel: the base stays, the hat goes
+        assert_eq!(top.to_latex(), "x y");
+        assert_eq!(cur.index, 2);
+        cur.backspace(&mut top); // plain delete resumes
+        assert_eq!(top.to_latex(), "x");
     }
 
     #[test]
