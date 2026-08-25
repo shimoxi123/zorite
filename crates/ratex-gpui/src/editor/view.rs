@@ -89,6 +89,9 @@ pub struct MathEditor {
     toolbar_drag: Option<(f32, f32)>,
     /// During an autocomplete-scrollbar drag: (grab mouse y, scrolled px at grab).
     thumb_drag: Option<(f32, f32)>,
+    /// During a mouse drag over the formula: the cursor at the press, i.e. the
+    /// selection's fixed end. Selection is single-row, like shift-arrows.
+    select_drag: Option<Cursor>,
     /// In-line edit mode (hosted in a note's text flow): left-align the formula at its spot
     /// and hide the floating palette + white background, vs the centered standalone editor.
     inline: bool,
@@ -117,6 +120,17 @@ const PALETTE_W: f32 = 200.0;
 struct GripDrag;
 
 impl Render for GripDrag {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Drag payload for mouse selection over the formula — same on_drag/on_drag_move
+/// machinery as [`GripDrag`], so events keep flowing when the pointer leaves the
+/// formula's bounds mid-drag.
+struct SelectDrag;
+
+impl Render for SelectDrag {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
@@ -242,6 +256,7 @@ impl MathEditor {
             toolbar_off: (0.0, 8.0),
             toolbar_drag: None,
             thumb_drag: None,
+            select_drag: None,
             inline,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1080,12 +1095,52 @@ impl Render for MathEditor {
                     }
                 }),
             )
+            .on_drag_move(
+                cx.listener(|this, e: &gpui::DragMoveEvent<SelectDrag>, _window, cx| {
+                    let Some(from) = this.select_drag.clone() else {
+                        return;
+                    };
+                    let Some((ex, ey)) = this.em_at(e.event.position) else {
+                        return;
+                    };
+                    let to = geometry::cursor_at(&this.root, ex, ey);
+                    // Selection is single-row: both ends climb to their deepest COMMON
+                    // row, taking each structure crossed in whole (a press inside one
+                    // accent's base dragged into another's must not bail).
+                    let (path, lo, hi) = crate::editor::cursor::common_row_selection(&from, &to);
+                    if lo == hi {
+                        this.anchor = None;
+                        this.cursor = Cursor { path, index: lo };
+                    } else {
+                        // The moving end follows the pointer's side of the range: compare
+                        // the two ends' positions at the common depth (the same measure
+                        // common_row_selection orders by).
+                        let depth = path.len();
+                        let pos = |c: &Cursor| c.path.get(depth).map(|s| s.atom).unwrap_or(c.index);
+                        let (fixed, moving) = if pos(&from) <= pos(&to) {
+                            (lo, hi)
+                        } else {
+                            (hi, lo)
+                        };
+                        this.anchor = Some(Cursor {
+                            path: path.clone(),
+                            index: fixed,
+                        });
+                        this.cursor = Cursor {
+                            path,
+                            index: moving,
+                        };
+                    }
+                    cx.notify();
+                }),
+            )
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseUpEvent, _window, cx| {
                     let dragged = this.palette_drag.take().is_some();
                     let dragged = this.toolbar_drag.take().is_some() || dragged;
                     let dragged = this.thumb_drag.take().is_some() || dragged;
+                    this.select_drag = None;
                     if dragged {
                         cx.notify();
                     }
@@ -1110,9 +1165,14 @@ impl Render for MathEditor {
             .children(root_palette)
             .child(
                 div()
+                    .id("ratex-formula")
                     .relative()
                     .w(px(w))
                     .h(px(h))
+                    .on_drag(SelectDrag, |_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| SelectDrag)
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, ev: &MouseDownEvent, window, cx| {
@@ -1131,7 +1191,12 @@ impl Render for MathEditor {
                             }
                             // 1 click → caret, 2 → select the atom, 3+ → select the row/slot.
                             match ev.click_count {
-                                1 => this.click_to_caret(ev.position, cx),
+                                1 => {
+                                    this.click_to_caret(ev.position, cx);
+                                    // Arm drag-selection from the pressed caret; the root's
+                                    // SelectDrag on_drag_move extends it as the mouse moves.
+                                    this.select_drag = Some(this.cursor.clone());
+                                }
                                 2 => this.select_cell_at(ev.position, cx),
                                 _ => this.select_row_at(ev.position, cx),
                             }

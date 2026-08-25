@@ -119,6 +119,43 @@ fn resolve_mut<'a>(row: &'a mut Row, path: &[Step]) -> &'a mut Row {
     }
 }
 
+/// Collapse two positions into a selection in their deepest COMMON row: each end
+/// climbs out of any structure the other doesn't share, taking that structure in
+/// whole (MathQuill's drag-selection semantics). Returns `(row_path, lo, hi)`;
+/// `lo == hi` when both ends resolve to the same spot.
+pub fn common_row_selection(a: &Cursor, b: &Cursor) -> (Vec<Step>, usize, usize) {
+    let common = a
+        .path
+        .iter()
+        .zip(b.path.iter())
+        .take_while(|(x, y)| x == y)
+        .count();
+    // Each end's position at the common depth: the atom of the structure it's still
+    // inside, or its own index when it lives in the common row.
+    let pos = |c: &Cursor| c.path.get(common).map(|s| s.atom).unwrap_or(c.index);
+    let (pa, pb) = (pos(a), pos(b));
+    let path = a.path[..common].to_vec();
+    if a.path.len() > common && b.path.len() > common && pa == pb {
+        // Both inside the same structure but on divergent branches (e.g. a
+        // fraction's num vs den): the selection is that structure, whole.
+        return (path, pa, pa + 1);
+    }
+    // The left end includes its structure from its left edge (the atom itself);
+    // the right end includes through its right edge (atom + 1).
+    let edge = |c: &Cursor, p: usize, rightward: bool| {
+        if c.path.len() > common {
+            if rightward { p + 1 } else { p }
+        } else {
+            c.index
+        }
+    };
+    if pa <= pb {
+        (path, edge(a, pa, false), edge(b, pb, true))
+    } else {
+        (path, edge(b, pb, false), edge(a, pa, true))
+    }
+}
+
 impl Cursor {
     /// Cursor at the start of the top-level row.
     pub fn start() -> Self {
@@ -687,6 +724,49 @@ mod tests {
         cur.move_right(&top); // base end -> out after the accent
         assert_eq!(cur.path, vec![]);
         assert_eq!(cur.index, 1);
+    }
+
+    #[test]
+    fn common_row_selection_reconciles_divergent_ends() {
+        let step = |atom, slot| Step { atom, slot };
+        // Ends inside two different structures of the top row: both climb out,
+        // each structure taken whole (atoms 1 and 3 → 1..4).
+        let a = Cursor {
+            path: vec![step(1, Slot::Base)],
+            index: 0,
+        };
+        let b = Cursor {
+            path: vec![step(3, Slot::Base)],
+            index: 1,
+        };
+        assert_eq!(common_row_selection(&a, &b), (vec![], 1, 4));
+        // Order-independent.
+        assert_eq!(common_row_selection(&b, &a), (vec![], 1, 4));
+        // One end deep, one in the row: the structure is included whole.
+        let c = Cursor {
+            path: vec![],
+            index: 0,
+        };
+        assert_eq!(common_row_selection(&c, &a), (vec![], 0, 2));
+        // Divergent branches of the SAME structure select just that structure.
+        let n = Cursor {
+            path: vec![step(2, Slot::Num)],
+            index: 0,
+        };
+        let d = Cursor {
+            path: vec![step(2, Slot::Den)],
+            index: 1,
+        };
+        assert_eq!(common_row_selection(&n, &d), (vec![], 2, 3));
+        // Both in one nested row: a plain range there.
+        let e = Cursor {
+            path: vec![step(2, Slot::Num)],
+            index: 2,
+        };
+        assert_eq!(
+            common_row_selection(&n, &e),
+            (vec![step(2, Slot::Num)], 0, 2)
+        );
     }
 
     #[test]
