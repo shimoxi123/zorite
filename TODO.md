@@ -324,6 +324,21 @@ Follow-ups from reviewing #70 (fixed in the branch that follows it):
 Crate-internal defects and API hygiene, mostly surfaced by the 2026-07-06
 public-API audit (every crate now carries a complete `API.md`; these are the
 findings worth fixing rather than just documenting):
+- [ ] `ratex-gpui`: **accents in the structural editor** (#77 — can't type
+  `$\hat{X}$`). Three gaps, scoped 2026-08-25:
+  1. `Atom::Accent { accent, base }` — model + `to_latex` + parser mapping
+     (`ParseNode::Accent` currently *degrades to its inner content*, so
+     opening an existing `$\hat{X}$` in the editor and committing silently
+     rewrites it as `$X$` — data loss) + `Command::Accent` entries (hat,
+     widehat, bar, overline, vec, tilde, dot, ddot; caret into the base
+     slot) + geometry/cursor/render walks. `Sqrt` is the single-slot
+     template. The bulk of the work (~a session).
+  2. `{` / `}` arms in `type_char` — today `{` becomes `Atom::Sym("{")`,
+     a bare TeX group-open that renders as nothing (the reported "brace
+     never shows"). `{` should open the literal `\{…\}` Delim mirroring
+     `(`; `}` hops out mirroring `)`. ~10 lines; ships independently.
+  3. Escape `{`/`}` (and other TeX-active chars) in `Sym` serialization so
+     a stray brace can never emit invalid source. Falls out of 2; add a test.
 - [ ] `ratex-gpui`: **duplicate `"angle"` command** in the `input.rs` `COMMANDS`
   table — the ⟨⟩ delimiter pair shadows the `\angle` symbol entry (first-match
   lookup), so the symbol is unreachable by name; rename one (e.g. `langle`
