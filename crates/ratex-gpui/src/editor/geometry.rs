@@ -150,7 +150,7 @@ fn array_cell(
         col_aligns,
         row_heights,
         row_depths,
-        col_gap,
+        col_gaps,
         offset,
         content_x_offset,
         ..
@@ -169,7 +169,8 @@ fn array_cell(
         + col_widths
             .iter()
             .take(tc)
-            .map(|w| (*w + *col_gap) * scale)
+            .zip(col_gaps.iter())
+            .map(|(w, gap_after)| (*w + *gap_after) * scale)
             .sum::<f64>();
     let cw = col_widths[tc];
     let cell_x = match col_aligns.get(tc).copied().unwrap_or(b'c') {
