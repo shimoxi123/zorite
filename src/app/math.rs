@@ -224,8 +224,19 @@ impl AppView {
         // Seat the editor: an inline `$…$` overlays the formula's spot (surrounding text stays
         // put); a `$$` block reserves a full-width gap at its row, sized to the cached render.
         if inline {
+            // Align the editor's glyphs with the displayed formula's: the editor pads
+            // its raster PAD px at text size, but the display raster's PAD was baked
+            // at the block em (FONT_SIZE) and scaled down — without compensation the
+            // formula shifts down/right by the difference on entering edit (#77).
+            let pad_delta =
+                ratex_gpui::render::PAD * (self.text_size / crate::math::FONT_SIZE - 1.0);
             source.update(cx, |e, cx| {
-                e.set_editing_inline(range, editor.clone().into(), cx)
+                e.set_editing_inline(
+                    range,
+                    editor.clone().into(),
+                    gpui::point(gpui::px(pad_delta), gpui::px(pad_delta)),
+                    cx,
+                )
             });
         } else {
             let height = self

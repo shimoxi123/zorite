@@ -994,6 +994,11 @@ struct EditingBlock {
 struct EditingInline {
     range: Range<usize>,
     view: gpui::AnyView,
+    /// Where the view's top-left sits relative to the formula raster's top-left. The
+    /// host's editor view pads its raster differently than the display raster (whose
+    /// padding was baked at the block em and scaled down), so a zero offset shifts
+    /// the glyphs visibly on entering edit.
+    offset: Point<Pixels>,
 }
 
 impl EditorState {
@@ -1409,13 +1414,20 @@ impl EditorState {
 
     /// Begin a structural edit of the inline `$…$` span at `range` (absolute bytes): overlay
     /// `view` (the host's editor) at the formula's painted spot. The host focuses `view`.
+    /// `offset` places the view relative to the raster's top-left, letting the host
+    /// align the view's glyphs with the displayed formula's (their paddings differ).
     pub fn set_editing_inline(
         &mut self,
         range: Range<usize>,
         view: gpui::AnyView,
+        offset: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.editing_inline = Some(EditingInline { range, view });
+        self.editing_inline = Some(EditingInline {
+            range,
+            view,
+            offset,
+        });
         cx.notify();
     }
 
@@ -1615,8 +1627,8 @@ impl EditorState {
         Some(
             div()
                 .absolute()
-                .top(rect.origin.y - origin.y)
-                .left(rect.origin.x - origin.x)
+                .top(rect.origin.y - origin.y + ei.offset.y)
+                .left(rect.origin.x - origin.x + ei.offset.x)
                 .occlude()
                 .child(ei.view.clone()),
         )
@@ -1816,7 +1828,22 @@ impl EditorState {
         if visual_right {
             self.next_visible_boundary(off)
         } else {
-            self.prev_visible_boundary(off)
+            let target = self.prev_visible_boundary(off);
+            // Same nudge as the bidi branch above: a leftward step over a formula's
+            // spacer resolves to the span's START, which fails `left()`'s strictly-
+            // inside test — so on plain LTR rows the editor never opened from the
+            // right and the caret just seated at the formula's start (#77).
+            let (trow, _) = self.row_col(target);
+            let line_start = self.line_starts()[trow];
+            let here = off.saturating_sub(line_start);
+            let lands_on_a_formula = markdown_syntax::inline_math_spans(self.line_str(trow))
+                .into_iter()
+                .any(|s| line_start + s.start == target && !(s.start < here && here < s.end));
+            if lands_on_a_formula {
+                target + 1
+            } else {
+                target
+            }
         }
     }
 
