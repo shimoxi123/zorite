@@ -117,6 +117,7 @@ settings:
     text_size: 字号
     line_numbers: 行号
     mouse_cursor: 鼠标指针
+    sidebar_position: 侧边栏靠右
     installed_themes: 已安装主题
     pdf_quality: PDF 渲染质量
     wysiwyg: WYSIWYG 编辑
@@ -147,6 +148,7 @@ settings:
     text_size: "编辑和阅读时笔记文字的大小。标题和行内公式会随之缩放。"
     line_numbers: "在页面和日志日期的编辑器旁显示带编号的行号槽——按逻辑源码行计数，换行文本只计一次。阅读视图保持简洁。"
     mouse_cursor: "Zorite 内的指针。添加任意 XCursor 主题文件夹（Linux 光标主题格式）以使用您自己的指针。"
+    sidebar_position: "开启时侧边栏（页面列表、搜索）停靠在窗口右侧；关闭时保持在左侧。"
     installed_themes: "将 .json 主题文件放入您的主题文件夹，然后重新加载。省略的任何颜色会回退到基础调色板。"
     pdf_quality: "越高越清晰但越慢；越低在较慢的机器上渲染更快。100% = 您显示器的原生分辨率。"
     wysiwyg: "开启时在输入时内联显示格式（粗体、标题、链接）。关闭时编辑纯 Markdown 并在按 Esc 时显示渲染后的页面。"

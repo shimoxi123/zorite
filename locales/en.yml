@@ -117,6 +117,7 @@ settings:
     text_size: Text size
     line_numbers: Line numbers
     mouse_cursor: Mouse cursor
+    sidebar_position: Sidebar on the right
     installed_themes: Installed themes
     pdf_quality: PDF render quality
     wysiwyg: WYSIWYG editing
@@ -147,6 +148,7 @@ settings:
     text_size: "Size of note text when editing and reading. Headings and inline math scale with it."
     line_numbers: "Show a numbered gutter beside the editor on pages and journal days - logical source lines, wrapped text counts once. The reading view stays clean."
     mouse_cursor: "The pointer inside Zorite. Add any XCursor theme folder (the Linux cursor-theme format) to use your own."
+    sidebar_position: "On docks the sidebar (page list, search) on the right edge of the window; off keeps it on the left."
     installed_themes: "Drop .json theme files in your themes folder, then Reload. Any color you omit falls back to the base palette."
     pdf_quality: "Higher is sharper but slower; lower speeds up rendering on slower machines. 100% = your display's native resolution."
     wysiwyg: "On shows formatting (bold, headings, links) inline as you type. Off edits plain Markdown and shows the rendered page on Esc."

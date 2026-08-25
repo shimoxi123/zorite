@@ -23,7 +23,7 @@ use rust_i18n::t;
 
 pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> impl IntoElement {
     if app.sidebar_collapsed {
-        collapsed_rail(cx).into_any_element()
+        collapsed_rail(app.sidebar_right, cx).into_any_element()
     } else {
         expanded(app, window, cx).into_any_element()
     }
@@ -85,7 +85,15 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
         .flex()
         .flex_col()
         .bg(theme::bg_sidebar())
-        .border_r_1()
+        // The border faces the content: right edge when the sidebar docks
+        // left (the default), left edge when it docks right.
+        .map(|el| {
+            if app.sidebar_right {
+                el.border_l_1()
+            } else {
+                el.border_r_1()
+            }
+        })
         .border_color(theme::border_subtle())
         .child(
             // Header: the collapse caret on the left, the jump-to-date and
@@ -102,9 +110,12 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
                     div()
                         .flex()
                         .flex_row()
+                        // Docked right, the header mirrors: caret at the outer
+                        // (right) edge, the icon cluster inward.
+                        .when(app.sidebar_right, |el| el.flex_row_reverse())
                         .items_center()
                         .justify_between()
-                        .child(collapse_caret(cx))
+                        .child(collapse_caret(app.sidebar_right, cx))
                         .child(
                             div()
                                 .flex()
@@ -414,7 +425,7 @@ fn row_btn(
 
 /// The collapsed sidebar: a thin icon rail with the expand caret (`>`) at the
 /// top, then the jump-to-date and settings icons.
-fn collapsed_rail(cx: &mut Context<AppView>) -> impl IntoElement {
+fn collapsed_rail(right: bool, cx: &mut Context<AppView>) -> impl IntoElement {
     div()
         .w(px(48.0))
         .h_full()
@@ -425,9 +436,15 @@ fn collapsed_rail(cx: &mut Context<AppView>) -> impl IntoElement {
         .gap_1()
         .pt_2()
         .bg(theme::bg_sidebar())
-        .border_r_1()
+        .map(|el| {
+            if right {
+                el.border_l_1()
+            } else {
+                el.border_r_1()
+            }
+        })
         .border_color(theme::border_subtle())
-        .child(expand_caret(cx))
+        .child(expand_caret(right, cx))
         .child(new_page_icon(cx))
         .child(all_pages_icon(cx))
         .child(date_icon(cx))
@@ -448,18 +465,30 @@ fn icon_btn(id: &'static str, icon: impl Into<Icon>) -> Stateful<Div> {
         .child(Icon::new(icon).size_4())
 }
 
-/// Collapse caret (`<`), in the expanded header — hides the sidebar to a rail.
-fn collapse_caret(cx: &mut Context<AppView>) -> impl IntoElement {
-    icon_btn("collapse-sidebar", IconName::ChevronLeft).on_click(cx.listener(
+/// Collapse caret, in the expanded header — hides the sidebar to a rail. It
+/// points toward the edge the sidebar retreats to (`<` left dock, `>` right).
+fn collapse_caret(right: bool, cx: &mut Context<AppView>) -> impl IntoElement {
+    let icon = if right {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronLeft
+    };
+    icon_btn("collapse-sidebar", icon).on_click(cx.listener(
         |this: &mut AppView, _: &ClickEvent, _window, cx| {
             this.toggle_sidebar(cx);
         },
     ))
 }
 
-/// Expand caret (`>`), at the top of the collapsed rail — reopens the sidebar.
-fn expand_caret(cx: &mut Context<AppView>) -> impl IntoElement {
-    icon_btn("expand-sidebar", IconName::ChevronRight).on_click(cx.listener(
+/// Expand caret, at the top of the collapsed rail — reopens the sidebar. It
+/// points back toward the content (`>` left dock, `<` right).
+fn expand_caret(right: bool, cx: &mut Context<AppView>) -> impl IntoElement {
+    let icon = if right {
+        IconName::ChevronLeft
+    } else {
+        IconName::ChevronRight
+    };
+    icon_btn("expand-sidebar", icon).on_click(cx.listener(
         |this: &mut AppView, _: &ClickEvent, _window, cx| {
             this.toggle_sidebar(cx);
         },

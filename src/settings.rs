@@ -248,6 +248,11 @@ const SECTIONS: &[(Tab, &str, &str)] = &[
     ),
     (
         Tab::Appearance,
+        "settings.section.sidebar_position",
+        "left right side dock rail move rtl navigation panel",
+    ),
+    (
+        Tab::Appearance,
         "settings.section.installed_themes",
         "custom user json reload reveal folder",
     ),
@@ -1687,6 +1692,22 @@ impl Render for SettingsView {
                 }
             });
 
+        // Sidebar dock side (Appearance pane): checked = docked right.
+        let sb_right = self
+            .app
+            .upgrade()
+            .map(|a| a.read(cx).sidebar_right)
+            .unwrap_or(false);
+        let sb_app = self.app.clone();
+        let sidebar_side_switch = Switch::new("sidebar-right-toggle")
+            .small()
+            .checked(sb_right)
+            .on_click(move |checked, _window, cx| {
+                if let Some(app) = sb_app.upgrade() {
+                    app.update(cx, |a, cx| a.set_sidebar_right(*checked, cx));
+                }
+            });
+
         // Line-number gutter toggle (Markdown pane).
         let ln_on = self
             .app
@@ -2351,6 +2372,11 @@ impl Render for SettingsView {
                                     "settings.section.mouse_cursor",
                                     "settings.desc.mouse_cursor",
                                     cursor_control,
+                                ))
+                                .child(self.section_card(
+                                    "settings.section.sidebar_position",
+                                    "settings.desc.sidebar_position",
+                                    sidebar_side_switch,
                                 ))
                                 .child(self.section_card(
                                     "settings.section.installed_themes",

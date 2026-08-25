@@ -24,7 +24,7 @@ use gpui::{
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription,
     Task, TitlebarOptions, WeakEntity, Window, WindowAppearance, WindowBounds, WindowDecorations,
-    WindowHandle, WindowOptions, div, point, px, size,
+    WindowHandle, WindowOptions, div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     Root, Sizable, TitleBar, WindowExt,
@@ -610,6 +610,9 @@ pub struct AppView {
     /// When collapsed, the sidebar shrinks to a thin icon rail (expand caret +
     /// the calendar/settings icons); the page list and search box hide.
     pub sidebar_collapsed: bool,
+    /// Dock the sidebar on the right edge of the window instead of the left
+    /// (Settings → Appearance; handy for RTL-leaning layouts).
+    pub sidebar_right: bool,
     /// Ids of recently-viewed named pages, most-recent first (capped). The
     /// sidebar page tree is filtered to these; persisted across launches.
     pub recent_pages: Vec<i64>,
@@ -908,6 +911,7 @@ impl AppView {
             calendar_days: Default::default(),
             show_calendar: false,
             sidebar_collapsed: false,
+            sidebar_right: false,
             recent_pages: Vec::new(),
             favorites: Vec::new(),
             collapsed_nodes: HashSet::new(),
@@ -1029,6 +1033,11 @@ impl AppView {
         this.line_numbers = this
             .db
             .get_setting("line_numbers")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        this.sidebar_right = this
+            .db
+            .get_setting("sidebar_right")
             .map(|v| v == "1")
             .unwrap_or(false);
         this.auto_link.set(
@@ -5726,6 +5735,18 @@ impl AppView {
         self.line_numbers
     }
 
+    /// Dock the sidebar on the right (Settings → Appearance); persisted.
+    pub fn set_sidebar_right(&mut self, right: bool, cx: &mut Context<Self>) {
+        if self.sidebar_right == right {
+            return;
+        }
+        self.sidebar_right = right;
+        let _ = self
+            .db
+            .set_setting("sidebar_right", if right { "1" } else { "0" });
+        cx.notify();
+    }
+
     /// Toggle the page editor's line-number gutter (Settings → Markdown).
     pub fn set_line_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.line_numbers != on {
@@ -7260,6 +7281,8 @@ impl Render for AppView {
                     .min_h_0()
                     .flex()
                     .flex_row()
+                    // Docked right: same children, reversed visual order.
+                    .when(self.sidebar_right, |el| el.flex_row_reverse())
                     .child(ui::sidebar::render(self, window, cx))
                     .child(
                         div()
