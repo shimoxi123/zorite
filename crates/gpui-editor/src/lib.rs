@@ -1404,6 +1404,13 @@ impl EditorState {
         cx.notify();
     }
 
+    /// The byte range of the block currently being structurally edited (the range handed
+    /// to [`Self::set_editing_block`] — the source text is untouched while the edit is
+    /// open, so it stays valid). `None` when no block edit is open.
+    pub fn editing_block_range(&self) -> Option<Range<usize>> {
+        self.editing_block.as_ref().map(|eb| eb.range.clone())
+    }
+
     /// End an in-line math edit (the host has committed / cancelled). Returns the block's
     /// byte range, so the host can overwrite it.
     pub fn end_editing_block(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
@@ -2746,10 +2753,24 @@ impl EditorState {
         // report no math block here — clicks / arrows / `/math` stay in the text editor.
         self.markdown_style.as_ref()?;
         let starts = self.line_starts();
-        markdown_syntax::math_blocks(&self.content)
-            .into_iter()
+        let blocks = markdown_syntax::math_blocks(&self.content);
+        blocks
+            .iter()
             .find(|(r, _)| r.contains(&row))
-            .map(|(r, source)| (starts[r.start]..self.line_end(r.end - 1), source.into()))
+            .or_else(|| {
+                // A `<!-- math:ALIGN -->` marker row belongs to the block directly
+                // below it: it's invisible in WYSIWYG, so a caret seated there —
+                // e.g. arrow-up returns offset 0 when the block opens the document
+                // (#77) — would reveal the raw rows instead of opening the editor.
+                markdown_syntax::math_align_marker(self.line_str(row))?;
+                blocks.iter().find(|(r, _)| r.start == row + 1)
+            })
+            .map(|(r, source)| {
+                (
+                    starts[r.start]..self.line_end(r.end - 1),
+                    source.clone().into(),
+                )
+            })
     }
 
     /// A `$$` block's byte range grown for deletion: takes in the
@@ -4091,11 +4112,13 @@ impl EditorState {
             }
         } else {
             let (start_row, _) = self.row_col(block.start);
-            if start_row > 0 {
-                self.line_end(start_row - 1)
-            } else {
-                0
+            // An alignment marker directly above belongs to the block — resting
+            // on it reveals the region, so step past it too.
+            let mut row = start_row;
+            if row > 0 && markdown_syntax::math_align_marker(self.line_str(row - 1)).is_some() {
+                row -= 1;
             }
+            if row > 0 { self.line_end(row - 1) } else { 0 }
         };
         self.move_to(target, cx);
     }

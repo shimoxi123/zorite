@@ -355,6 +355,21 @@ impl MathEditor {
         // An arrow that left the caret unmoved in normal mode is a boundary: hand focus back
         // to the host so the text caret flows out of the formula (left/up → before the block,
         // right/down → after it), the way arrowing past a table cell's edge exits the table.
+        // An up that can't move seats the caret at the formula's start (text-editor
+        // convention for up on the first line); only a second up at the start exits.
+        // Keeps a stray up from dumping the caret out of the formula — worst where
+        // the block opens the document and "before the block" reveals the raw source.
+        if was_normal
+            && !ks.modifiers.shift
+            && ks.key == "up"
+            && self.cursor == cursor_before
+            && self.cursor != Cursor::start()
+        {
+            self.anchor = None;
+            self.cursor = Cursor::start();
+            cx.notify();
+            return;
+        }
         if was_normal
             && !ks.modifiers.shift
             && self.cursor == cursor_before

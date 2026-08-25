@@ -427,6 +427,20 @@ impl AppView {
     /// same line; a `$$` block seats it on the adjacent line.
     fn exit_math_edit(&mut self, after: bool, window: &mut Window, cx: &mut Context<Self>) {
         let inline = self.math_edit.as_ref().is_some_and(|m| m.inline);
+        // A `$$` block with nothing above it (document start, or only its own
+        // `<!-- math:ALIGN -->` marker): exiting "before" would seat the text caret
+        // on the opening fence row and reveal the raw source — stay in the formula.
+        if !after
+            && !inline
+            && let Some(edit) = self.math_edit.as_ref()
+            && let Some(range) = edit.source.read(cx).editing_block_range()
+        {
+            let text = edit.source.read(cx).value();
+            let above = text[..range.start.min(text.len())].trim_end_matches('\n');
+            if above.is_empty() || (!above.contains('\n') && above.starts_with("<!-- math:")) {
+                return;
+            }
+        }
         if let Some((source, block)) = self.commit_math_edit(cx) {
             // ratex-gpui reports the arrow it was handed — left/up = before the
             // span, right/down = after — which is the left-to-right reading. On
