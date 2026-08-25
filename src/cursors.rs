@@ -325,7 +325,7 @@ fn rasterize(svg: &str, hotspot64: (f32, f32)) -> Option<Vec<Image>> {
         );
         // tiny-skia's premultiplied RGBA → the crate's premultiplied BGRA.
         let mut bgra = pixmap.take();
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         frames.push(Image {
