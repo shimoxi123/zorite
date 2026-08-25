@@ -423,7 +423,9 @@ impl MathEditor {
             },
             _ => match ks.key_char.as_ref().and_then(|s| s.chars().next()) {
                 Some('\\') => {
-                    self.anchor = None;
+                    // Keep the anchor: a selection survives into `\command` mode so a
+                    // wrap-capable command (frac, sqrt, delimiters, accents) typed over
+                    // it wraps it, MathQuill-style — commit_pending passes it along.
                     self.pending = Some(String::new());
                     self.selected = 0;
                     self.scroll_match_into_view();
@@ -527,10 +529,14 @@ impl MathEditor {
     /// Resolve the pending `\name`: the highlighted match, else the literal letters.
     fn commit_pending(&mut self) {
         let name = self.pending.take().unwrap_or_default();
+        let sel = self.selection_range();
+        self.anchor = None;
         let matches = input::command_matches(&name);
         match matches.get(self.selected).or_else(|| matches.first()) {
             Some(&chosen) => {
-                input::commit_command(&mut self.root, &mut self.cursor, chosen);
+                // A wrap-capable command typed over a selection wraps it (the
+                // selection becomes the numerator / radicand / accent base).
+                input::commit_command_selecting(&mut self.root, &mut self.cursor, chosen, sel);
             }
             None => {
                 for c in name.chars() {
