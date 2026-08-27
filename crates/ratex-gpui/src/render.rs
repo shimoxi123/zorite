@@ -72,7 +72,7 @@ fn rasterize(latex: &str, font_size: f32, dpr: f32, rgb: [u8; 3]) -> Option<(Vec
     // bg → 0, black glyph → 255), painting `rgb` flat. gpui's RenderImage holds STRAIGHT
     // (non-premultiplied) BGRA, so the color must NOT be premultiplied — that double-darkens it.
     let [r, g, b] = rgb;
-    for px in bytes.chunks_exact_mut(4) {
+    for px in bytes.as_chunks_mut::<4>().0 {
         let a = 255 - px[0]; // grayscale raster: the red channel is the luminance
         px[0] = b;
         px[1] = g;

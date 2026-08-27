@@ -403,7 +403,7 @@ fn scale_and_bgra(img: image::DynamicImage) -> RgbaImage {
     let mut rgba = small.into_rgba8();
     // gpui's `RenderImage` holds straight (non-premultiplied) BGRA; the decoded
     // buffer is RGBA, so swap R and B to match.
-    for px in rgba.chunks_exact_mut(4) {
+    for px in rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
     rgba

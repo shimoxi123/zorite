@@ -161,7 +161,12 @@ pub fn render_page(doc: &Document, idx: usize, scale: f32) -> Result<Arc<RenderI
     let (w, h) = (u32::from(pixmap.width()), u32::from(pixmap.height()));
     let src = pixmap.data_as_u8_slice(); // premultiplied RGBA8, row-major
     let mut bgra = vec![0u8; src.len()];
-    for (out, p) in bgra.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+    for (out, p) in bgra
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<4>().0)
+    {
         // Composite premultiplied src over white (out = src + 255-a; src ≤ a so no
         // overflow), then RGBA→BGRA (gpui's RenderImage is BGRA).
         let add = 255 - p[3];

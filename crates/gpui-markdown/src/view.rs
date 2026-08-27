@@ -3,19 +3,20 @@
 //! crate docs; `syntax` (always compiled, dependency-free) holds the shared
 //! construct recognition.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::Rc;
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use gpui::{
     AnyElement, App, Bounds, ClipboardItem, Corners, ElementId, FontStyle, FontWeight,
     HighlightStyle, Hsla, InteractiveElement, InteractiveText, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Pixels, RenderImage, RenderOnce, ScrollHandle, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText, TextRun, Window, canvas,
-    div, point, prelude::FluentBuilder, px, relative, rgb, rgba, size, svg,
+    MouseDownEvent, ParentElement, Pixels, Point, RenderImage, RenderOnce, ScrollHandle,
+    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText, TextLayout,
+    TextRun, Window, canvas, div, point, prelude::FluentBuilder, px, relative, rgb, rgba, size,
+    svg,
 };
 use markdown::mdast;
 
@@ -453,11 +454,35 @@ pub type TaskToggleHandler = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 pub type HeadingToggleHandler = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 
 /// A rendered markdown document element — the reader view of a note.
+///
+/// Host-injectable UI labels the reader renders (the code-card `Copy`
+/// button). The crate stays host-agnostic so it never calls `t!()`; the app
+/// passes localized strings via [`MarkdownView::set_labels`]. The default is
+/// English, keeping the crate usable standalone.
+#[derive(Clone)]
+pub struct Labels {
+    /// The code-card `Copy` button.
+    pub code_copy: SharedString,
+}
+
+impl Default for Labels {
+    fn default() -> Self {
+        Self {
+            code_copy: "Copy".into(),
+        }
+    }
+}
+
+/// A rendered markdown document element — the reader view of a note.
 #[derive(IntoElement)]
 pub struct MarkdownView {
     id_base: SharedString,
     source: SharedString,
     style: MarkdownStyle,
+    /// Host-injectable UI labels (the code-card `Copy` button); English by
+    /// default, localized through [`Self::set_labels`] — the crate stays
+    /// host-agnostic so it never calls `t!()`.
+    labels: Labels,
     on_wiki_link: Option<WikiLinkHandler>,
     on_image: Option<ImageRenderer>,
     on_mermaid: Option<MermaidRenderer>,
@@ -511,7 +536,14 @@ impl MarkdownView {
             on_embed_image: None,
             folded_headings: HashSet::new(),
             on_heading_toggle: None,
+            labels: Labels::default(),
         }
+    }
+
+    /// Set the host-localized labels (code-card `Copy` etc.).
+    pub fn set_labels(mut self, labels: Labels) -> Self {
+        self.labels = labels;
+        self
     }
 
     pub fn style(mut self, style: MarkdownStyle) -> Self {
@@ -655,21 +687,23 @@ impl MarkdownView {
 /// visible day on any interaction, and re-running `to_mdast` for every
 /// non-editing day was the dominant per-frame cost (O(days × content)).
 /// Keyed by the exact source string (no hash collisions to reason about;
-/// the cap bounds memory to ~a few dozen notes of text), LRU-evicted, and
-/// thread-local — gpui renders every window on the one UI thread, so all
-/// windows share hits and there's no locking.
+/// the cap bounds memory to ~a few dozen notes of text) and LRU-evicted.
+/// Process-global, not thread-local: a background [`warm_parse`] has to be
+/// able to fill what the render thread later reads (issue #60).
 const PARSE_CACHE_CAP: usize = 64;
 
-thread_local! {
-    #[allow(clippy::type_complexity)]
-    static PARSE_CACHE: RefCell<HashMap<String, (Arc<mdast::Node>, u64)>> =
-        RefCell::new(HashMap::new());
-    static PARSE_TICK: Cell<u64> = const { Cell::new(0) };
+/// The cache entries plus the LRU clock, bumped on every lookup and insert.
+type ParseCache = (HashMap<String, (Arc<mdast::Node>, u64)>, u64);
+
+static PARSE_CACHE: LazyLock<Mutex<ParseCache>> = LazyLock::new(|| Mutex::new((HashMap::new(), 0)));
+
+/// The cache guard. Nothing but map lookups runs under this lock — never a
+/// parse — so a poisoned lock means an unrelated panic and the entries are
+/// still sound to reuse.
+fn parse_cache() -> MutexGuard<'static, ParseCache> {
+    PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Parse `source` with the view's options (GFM + `$…$`/`$$…$$` math),
-/// memoized. `None` when the parser errors (not cached — the caller falls
-/// back to plain text).
 /// Alignment named by a `<!-- math:ALIGN -->` marker line.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MathMarkerAlign {
@@ -714,40 +748,187 @@ fn preceding_math_align(source: &str, start: Option<usize>) -> Option<MathMarker
     }
 }
 
+/// A cache hit for `source`, refreshing its LRU stamp. Never parses.
+fn cache_get(source: &str) -> Option<Arc<mdast::Node>> {
+    let mut cache = parse_cache();
+    cache.1 += 1;
+    let tick = cache.1;
+    let (node, last_used) = cache.0.get_mut(source)?;
+    *last_used = tick;
+    Some(node.clone())
+}
+
+/// Parse `source` with the view's options (GFM + `$…$`/`$$…$$` math),
+/// memoized. `None` when the parser errors (not cached — the caller falls
+/// back to plain text). Callers on a render thread go through
+/// [`parse_for_render`] instead, which won't parse an expensive shape inline.
 fn parse_cached(source: &str) -> Option<Arc<mdast::Node>> {
-    PARSE_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        let tick = PARSE_TICK.with(|t| {
-            let v = t.get() + 1;
-            t.set(v);
-            v
-        });
-        if let Some((node, last_used)) = map.get_mut(source) {
-            *last_used = tick;
-            return Some(node.clone());
+    if let Some(node) = cache_get(source) {
+        return Some(node);
+    }
+    // Enable block math (`$$…$$` -> a Math node) and inline `$…$`
+    // (`math_text` -> an InlineMath node). markdown's `math_text` already
+    // follows the sensible rules (a `$` followed/preceded by a non-space,
+    // etc.), so prose like "it cost $5" stays literal.
+    let mut opts = markdown::ParseOptions::gfm();
+    opts.constructs.math_flow = true;
+    opts.constructs.math_text = true;
+    // Parsed with the lock RELEASED: this is the expensive step (seconds on
+    // the shapes `is_cheap_to_parse` screens for), and a background warm must
+    // never stall a render thread that only wants a lookup.
+    let node = Arc::new(markdown::to_mdast(source, &opts).ok()?);
+    let mut cache = parse_cache();
+    cache.1 += 1;
+    let tick = cache.1;
+    if cache.0.len() >= PARSE_CACHE_CAP {
+        // Evict the least-recently-used entry (the cap is small; a linear
+        // scan is cheaper than an ordered structure).
+        if let Some(oldest) = cache
+            .0
+            .iter()
+            .min_by_key(|(_, (_, last))| *last)
+            .map(|(k, _)| k.clone())
+        {
+            cache.0.remove(&oldest);
         }
-        // Enable block math (`$$…$$` -> a Math node) and inline `$…$`
-        // (`math_text` -> an InlineMath node). markdown's `math_text` already
-        // follows the sensible rules (a `$` followed/preceded by a non-space,
-        // etc.), so prose like "it cost $5" stays literal.
-        let mut opts = markdown::ParseOptions::gfm();
-        opts.constructs.math_flow = true;
-        opts.constructs.math_text = true;
-        let node = Arc::new(markdown::to_mdast(source, &opts).ok()?);
-        if map.len() >= PARSE_CACHE_CAP {
-            // Evict the least-recently-used entry (the cap is small; a linear
-            // scan is cheaper than an ordered structure).
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, (_, last))| *last)
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
+    }
+    cache.0.insert(source.to_string(), (node.clone(), tick));
+    Some(node)
+}
+
+// The four thresholds below are calibrated against timings of the pinned
+// `markdown` crate, release build, on the shapes from issue #60. Crossing one
+// costs a single placeholder frame, never a refusal — so each sits far above
+// anything a written note reaches and far below where the parser falls over.
+
+/// Source bigger than this never parses on the render thread. Linear shapes
+/// stay fast well past it (measured: 129 KB of link-and-emphasis prose parses
+/// in 36 ms — a dropped frame, not a freeze), so this is only a backstop for
+/// pathological shapes the scan below doesn't recognize.
+const INLINE_PARSE_MAX: usize = 128 * 1024;
+
+/// Blockquote nesting deeper than this defers. Depth is the trigger for the
+/// worst shape in the issue: one line 25 000 `>` deep is 48 KB and 6.0 s,
+/// 8 000 deep is 475 ms, 2 000 deep is 35 ms. Written notes nest 1–3 (a GFM
+/// alert `> [!NOTE]` is 1, a quoted reply chain rarely 3), so 8 is orders of
+/// magnitude clear of both ends.
+const MAX_QUOTE_DEPTH: usize = 8;
+
+/// More `[` in the document than this defers. `[[[[[…` is the O(n²) bracket
+/// shape (378 ms at 50 KB); the cost tracks the TOTAL count, not the longest
+/// run — 8 brackets on each of 8 000 lines is 662 ms while a run of 8 on 500
+/// lines is 2.9 ms — so counting is the honest proxy. Measured: 4 000
+/// brackets is 2–6 ms, 16 000 is 37–88 ms. A note with 4 000 links doesn't
+/// happen; a note that dumps unmatched brackets does.
+const MAX_BRACKETS: usize = 4_000;
+
+/// More rows in a single table than this defers. GFM table parsing is
+/// superlinear in rows
+/// (the realistic accident, a pasted CSV: 1 000 five-column rows is 53 ms,
+/// 2 000 narrow rows 40 ms, and the issue measured 9.2 s at 200 KB), while
+/// 200 rows is 1–3 ms. Past that it's a pasted dataset, not a written table.
+const MAX_TABLE_ROWS: usize = 200;
+
+/// More `*`/`_` in the document than this defers. CommonMark's emphasis
+/// matcher is quadratic in unresolved delimiters, and this is the one
+/// pathological shape that carries no other tell — `*_*_*_…` is 58 KB of
+/// plain-looking text with no brackets, quotes or tables (2.6 s). Measured on
+/// that shape: 8 000 markers is 53 ms, 16 000 is 186 ms, 32 000 is 746 ms.
+/// Emphasis that actually pairs stays linear (8 000 markers of ordinary
+/// `*bold*` prose is 8.5 ms), so this only bites text that never resolves.
+const MAX_EMPHASIS: usize = 8_000;
+
+/// Linear pre-scan: can `source` be parsed on the render thread without a
+/// user-visible stall? Size alone does not predict cost — 200 KB of prose is
+/// fine while 48 KB of nested blockquotes is 6 s — so this also looks for the
+/// shapes that make `to_mdast` superlinear. It runs on every render of an
+/// uncached document, so it stays one cheap pass over the lines and bails at
+/// the first threshold crossed.
+fn is_cheap_to_parse(source: &str) -> bool {
+    if source.len() > INLINE_PARSE_MAX {
+        return false;
+    }
+    let mut rows = 0usize;
+    let mut brackets = 0usize;
+    let mut emphasis = 0usize;
+    for line in source.lines() {
+        let line = line.trim_start();
+        if line.starts_with('|') {
+            // Per-table, not per-document: the superlinear cost is inside one
+            // table's parse, so a note with several small tables is cheap even
+            // though their rows add up. A blank line (or any non-row) ends it.
+            rows += 1;
+            if rows > MAX_TABLE_ROWS {
+                return false;
+            }
+        } else {
+            rows = 0;
+        }
+        // Blockquote depth: the leading run of `>` markers (spaces between
+        // them are the usual `> > >` spelling). Stops at the first content
+        // byte, so it costs nothing on an ordinary line.
+        let mut depth = 0usize;
+        for b in line.bytes() {
+            match b {
+                b'>' => depth += 1,
+                b' ' | b'\t' => {}
+                _ => break,
             }
         }
-        map.insert(source.to_string(), (node.clone(), tick));
-        Some(node)
-    })
+        if depth > MAX_QUOTE_DEPTH {
+            return false;
+        }
+        for b in line.bytes() {
+            match b {
+                b'[' => brackets += 1,
+                b'*' | b'_' => emphasis += 1,
+                _ => {}
+            }
+        }
+        if brackets > MAX_BRACKETS || emphasis > MAX_EMPHASIS {
+            return false;
+        }
+    }
+    true
+}
+
+/// The parse a render pass is allowed to do. A cheap-shaped source parses
+/// inline as it always has; an expensive-shaped one renders only if something
+/// warmed the cache first — otherwise the caller falls back to plain text for
+/// this frame instead of freezing the window for seconds (issue #60), and the
+/// host's background [`warm_parse`] makes the next frame the real thing.
+fn parse_for_render(source: &str) -> Option<Arc<mdast::Node>> {
+    // Cache first. `is_cheap_to_parse` is a linear pass, and while it is cheap
+    // (byte scanning, early-bail), it would otherwise run on EVERY frame of
+    // every visible document — the journal feed renders several at once. Once
+    // a tree is cached the classification cannot change the answer, so skip it.
+    if let Some(node) = cache_get(source) {
+        return Some(node);
+    }
+    if is_cheap_to_parse(source) {
+        parse_cached(source)
+    } else {
+        // Expensive and not cached: render plain text for this frame and let
+        // the host's background warm fill the cache.
+        None
+    }
+}
+
+/// Parse `source` into the shared cache unless it's already there. Pure and
+/// gpui-free by design — call it from a background thread (the host uses
+/// `cx.background_executor()`), because that is the only place a superlinear
+/// parse can run without wedging the UI.
+pub fn warm_parse(source: &str) {
+    // Warms the key `MarkdownView::render` will look up, normalization and all.
+    let _ = parse_cached(&crate::syntax::normalize_math_fences(source));
+}
+
+/// Would rendering `source` block on a parse — i.e. is it expensive-shaped AND
+/// not cached yet? Hosts check this before spawning a warm task, so ordinary
+/// notes (which parse inline in microseconds) spawn nothing at all.
+pub fn needs_warm(source: &str) -> bool {
+    let source = crate::syntax::normalize_math_fences(source);
+    !is_cheap_to_parse(&source) && cache_get(&source).is_none()
 }
 
 impl RenderOnce for MarkdownView {
@@ -787,6 +968,7 @@ impl RenderOnce for MarkdownView {
             on_embed_image: self.on_embed_image,
             folded_headings: self.folded_headings,
             on_heading_toggle: self.on_heading_toggle,
+            code_copy: self.labels.code_copy,
             suppress_heading_top: false,
             strike_done: false,
             embed_depth: 0,
@@ -803,7 +985,7 @@ impl RenderOnce for MarkdownView {
             // the taller phi), so reading and editing space text identically.
             .line_height(relative(ctx.style.line_height));
 
-        let parsed = parse_cached(&source);
+        let parsed = parse_for_render(&source);
         match parsed.as_deref() {
             Some(mdast::Node::Root(root)) => {
                 for node in &root.children {
@@ -892,6 +1074,8 @@ struct Ctx {
     /// Fold chevron click → the host toggles the key. `None` = no chevrons
     /// (embeds, read-only surfaces).
     on_heading_toggle: Option<HeadingToggleHandler>,
+    /// The code-card `Copy` button label, injected by the host.
+    code_copy: SharedString,
     /// Set while rendering a list item's first block: drops a leading heading's
     /// top margin so the bullet marker lines up with the heading text instead of
     /// floating above it.
@@ -1000,7 +1184,21 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
                     _ => 6.0,
                 })
             };
+            // An RTL heading right-aligns like any other block (#66), and its
+            // fold chevron moves to the left so it stays on the text's
+            // trailing edge.
+            let h_rtl = h
+                .position
+                .as_ref()
+                .and_then(|p| ctx.source.get(p.start.offset..p.end.offset))
+                .is_some_and(|s| crate::syntax::content_direction(s).is_rtl());
             let text = div()
+                // Full width, else `inline_element`'s right-alignment has
+                // nothing to align WITHIN: a content-sized div sits left
+                // whatever its text alignment says.
+                .w_full()
+                .flex_1()
+                .min_w_0()
                 .text_size(size)
                 .text_color(color)
                 .font_weight(FontWeight::BOLD)
@@ -1037,7 +1235,8 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
                         .group(group)
                         .mt(top)
                         .flex()
-                        .flex_row()
+                        .when(h_rtl, |d| d.flex_row_reverse())
+                        .when(!h_rtl, |d| d.flex_row())
                         .items_center()
                         .gap(px(8.0))
                         .child(text)
@@ -1141,7 +1340,7 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
                                 ));
                             }
                         })
-                        .child("Copy"),
+                        .child(ctx.code_copy.clone()),
                 );
             Some(
                 div()
@@ -1201,11 +1400,21 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
             // a chevron joins the title, clicking flips the `-`/`+` in the
             // source (via the host's handler), and a folded callout shows only
             // its title.
+            // Direction from the quote's source, so the `>` markers and
+            // whitespace (neutral under UAX #9) don't skew it. Shared by the
+            // alert branch and the plain quote below.
+            let rtl = b
+                .position
+                .as_ref()
+                .and_then(|p| ctx.source.get(p.start.offset..p.end.offset))
+                .is_some_and(|s| crate::syntax::content_direction(s).is_rtl());
             if let Some((kind, fold, marker_offset, children)) = alert_parts(b) {
                 let color = kind.color(&ctx.style.alerts);
                 let mut title = div()
                     .flex()
-                    .flex_row()
+                    // The icon leads the label, so it swaps sides with the text.
+                    .when(rtl, |d| d.flex_row_reverse())
+                    .when(!rtl, |d| d.flex_row())
                     .items_center()
                     .gap(px(6.0))
                     .font_weight(FontWeight::BOLD)
@@ -1232,7 +1441,8 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
                             format!("{}-fold-{}", ctx.id_base, ctx.counter).into(),
                         ))
                         .flex()
-                        .flex_row()
+                        .when(rtl, |d| d.flex_row_reverse())
+                        .when(!rtl, |d| d.flex_row())
                         .items_center()
                         .gap(px(6.0))
                         .child(title)
@@ -1249,9 +1459,10 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
                     title = row.into_any_element();
                 }
                 let mut q = div()
-                    .border_l_2()
                     .border_color(color)
-                    .pl(px(12.0))
+                    // The rule goes on the side the text starts from.
+                    .when(rtl, |d| d.border_r_2().pr(px(12.0)))
+                    .when(!rtl, |d| d.border_l_2().pl(px(12.0)))
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
@@ -1266,10 +1477,11 @@ fn render_block(node: &mdast::Node, ctx: &mut Ctx, window: &mut Window) -> Optio
                 return Some(q.into_any_element());
             }
             let muted = ctx.style.muted_color;
+            // An RTL quote's rule belongs on the right, where the text starts.
             let mut q = div()
-                .border_l_2()
                 .border_color(muted)
-                .pl(px(12.0))
+                .when(rtl, |d| d.border_r_2().pr(px(12.0)))
+                .when(!rtl, |d| d.border_l_2().pl(px(12.0)))
                 .flex()
                 .flex_col()
                 .gap(px(6.0))
@@ -1613,10 +1825,20 @@ fn render_list(list: &mdast::List, ctx: &mut Ctx, depth: usize, window: &mut Win
         } else {
             marker_el.into_any_element()
         };
+        // An RTL item puts its bullet/number on the right (#66). Direction
+        // comes from the item's SOURCE slice — the list marker, digits and
+        // whitespace are all neutral under UAX #9, so `- سلام` reads RTL and
+        // `- hello` reads LTR.
+        let item_rtl = li
+            .position
+            .as_ref()
+            .and_then(|p| ctx.source.get(p.start.offset..p.end.offset))
+            .is_some_and(|s| crate::syntax::content_direction(s).is_rtl());
         col = col.child(
             div()
                 .flex()
-                .flex_row()
+                .when(item_rtl, |d| d.flex_row_reverse())
+                .when(!item_rtl, |d| d.flex_row())
                 .gap(px(8.0))
                 .child(marker_col)
                 .child(div().flex_1().min_w_0().child(content)),
@@ -1627,15 +1849,93 @@ fn render_list(list: &mdast::List, ctx: &mut Ctx, depth: usize, window: &mut Win
 
 // --- Inline rendering ---
 
+#[derive(Clone)]
 enum LinkTarget {
     Wiki(SharedString),
     Url(SharedString),
 }
 
+/// The text layout of whichever paragraph element got built.
+///
+/// RTL blocks lay themselves out (`gpui_bidi::paragraph`), because gpui wraps
+/// by slicing the reordered glyph run and gets the rows backwards — so the two
+/// directions carry different layouts. Everything downstream (link
+/// hit-testing, click-to-caret, seating an inline formula over its spacer)
+/// only ever asks these three questions, so it asks them here.
+enum TextHandle {
+    Ltr(TextLayout),
+    Rtl(gpui_bidi::paragraph::RtlLayout),
+}
+
+impl TextHandle {
+    fn index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        match self {
+            Self::Ltr(l) => l.index_for_position(position),
+            Self::Rtl(l) => l.index_for_position(position),
+        }
+    }
+
+    fn line_height(&self) -> Pixels {
+        match self {
+            Self::Ltr(l) => l.line_height(),
+            Self::Rtl(l) => l.line_height(),
+        }
+    }
+
+    /// Top-left corner of the spacer occupying `range`, where an inline raster
+    /// gets painted.
+    ///
+    /// In an LTR line that's just the start offset's position. In an RTL line
+    /// the start offset is the spacer's RIGHT edge — painting from there would
+    /// cover the words beside it — so the whole range's visual box is measured
+    /// and its left edge used.
+    fn raster_origin(&self, range: Range<usize>) -> Option<Point<Pixels>> {
+        match self {
+            Self::Ltr(l) => l.position_for_index(range.start),
+            Self::Rtl(l) => l.left_edge_of(range),
+        }
+    }
+}
+
+/// Open a link target. Shared by both directions: LTR goes through
+/// `InteractiveText`, RTL hit-tests through its own layout, but what a click
+/// DOES must not depend on which.
+fn follow_link(
+    target: Option<&LinkTarget>,
+    on_wiki: &Option<WikiLinkHandler>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match target {
+        Some(LinkTarget::Wiki(title)) => {
+            if let Some(handler) = on_wiki {
+                handler(title.clone(), window, cx);
+            }
+        }
+        // Only http(s) reaches the OS opener — the markdown is untrusted, and
+        // `open_url` runs the scheme's handler.
+        Some(LinkTarget::Url(url)) if crate::syntax::is_safe_external_url(url) => cx.open_url(url),
+        Some(LinkTarget::Url(_)) | None => {}
+    }
+}
+
 /// An inline raster spliced into a paragraph's text: `(display byte offset of
-/// the spacer, raster, logical w, h, image src)`. `src` is `Some` for an
-/// image (clickable → preview), `None` for a `$…$` formula.
-type InlineRaster = (usize, Arc<RenderImage>, f32, f32, Option<SharedString>);
+/// the spacer, spacer byte length, raster, logical w, h, image src)`. `src` is
+/// `Some` for an image (clickable → preview), `None` for a `$…$` formula.
+///
+/// The spacer's LENGTH is carried, not just where it starts, because an RTL
+/// line runs the other way: the first byte of the spacer sits at its RIGHT
+/// edge, and a raster painted from there covers the text beside it instead of
+/// the gap. With the range, the raster is placed by the spacer's actual
+/// visual box, which is correct whichever way the line runs.
+type InlineRaster = (
+    usize,
+    usize,
+    Arc<RenderImage>,
+    f32,
+    f32,
+    Option<SharedString>,
+);
 
 /// Window-space bounds of each painted inline image + its src, for click
 /// hit-testing (image click → preview).
@@ -1707,47 +2007,107 @@ fn inline_element(nodes: &[mdast::Node], ctx: &mut Ctx) -> AnyElement {
         inl.highlights
     };
 
+    // Writing direction for this block (#66). Detected from the RENDERED text
+    // — what the reader actually sees, markers already stripped — so a
+    // `- سلام` item and a `## سلام` heading both come out RTL. Every block
+    // that shows prose funnels through here (paragraphs, headings, list-item
+    // content, quotes, table cells), so this is the one place it's decided.
+    //
+    // Reader-only by design: the platform shapers already reorder RTL glyphs
+    // correctly, so alignment is all that's missing here. The EDITOR needs a
+    // logical↔visual index map before it can do the same — gpui's
+    // `x_for_index` collapses every caret offset in an RTL line onto x=0 (see
+    // the bidi note in TODO.md), and a right-aligned line with a broken caret
+    // would be worse than none.
+    let dir = crate::syntax::base_direction(&inl.text);
+    let align = move |el: AnyElement| -> AnyElement {
+        if dir.is_rtl() {
+            div().w_full().text_right().child(el).into_any_element()
+        } else {
+            el
+        }
+    };
+
     let math = std::mem::take(&mut inl.math);
-    let styled = StyledText::new(inl.text).with_highlights(highlights);
-    // Capture the text layout (a shared handle, populated on paint) so a click can
-    // be mapped to a rendered byte index, then to a source offset (and so a canvas can paint
-    // inline formulas over their spacers).
-    let layout = styled.layout().clone();
+
     // Rendered-text ranges of this block's links, so the click-to-caret handler
     // below can ignore a click that lands on a link. A link's own `on_click`
     // fires on mouse-*up*; the caret handler fires on mouse-*down*, so without
     // this it would enter the editor first and swallow the link click.
     let link_ranges: Vec<Range<usize>> = inl.links.iter().map(|(r, _)| r.clone()).collect();
+    let targets: Vec<LinkTarget> = inl.links.iter().map(|(_, t)| t.clone()).collect();
 
-    let inner = if inl.links.is_empty() {
-        styled.into_any_element()
+    // #66: an RTL paragraph cannot use gpui's wrapping. gpui shapes the whole
+    // paragraph as one line and slices it into rows by ascending x, and glyph
+    // order is visual — so the first row gets the paragraph's LAST words and a
+    // wrapped Persian note reads bottom-to-top. `RtlText` breaks in logical
+    // order first (UAX #9) and paints the rows itself.
+    //
+    // Everything past this point is direction-agnostic: it works off
+    // `TextHandle`, so links, click-to-caret and inline math behave the same
+    // either way.
+    // Any paragraph CONTAINING right-to-left text needs the mapping, not just
+    // one that reads that way: an English sentence quoting a Persian name
+    // misplaces the caret and its link hitboxes inside that phrase otherwise.
+    // `with_base_rtl` keeps such a paragraph left-aligned (#66).
+    let (inner, layout) = if crate::syntax::contains_rtl(&inl.text) {
+        let rtl = gpui_bidi::paragraph::RtlText::new(inl.text)
+            .with_base_rtl(dir.is_rtl())
+            .with_highlights(highlights)
+            .with_pointer_ranges(link_ranges.clone());
+        let layout = TextHandle::Rtl(rtl.layout().clone());
+        let inner = if link_ranges.is_empty() {
+            rtl.into_any_element()
+        } else {
+            // `InteractiveText` hit-tests through gpui's own layout, which is
+            // the thing that's wrong for RTL — so the click lands via the same
+            // handle that painted the rows. Mouse-DOWN, and consumed, so the
+            // click-to-caret wrapper below doesn't also fire.
+            let TextHandle::Rtl(hit) = &layout else {
+                unreachable!("just built as Rtl")
+            };
+            let hit = hit.clone();
+            let ranges = link_ranges.clone();
+            let targets = targets.clone();
+            let on_wiki = ctx.on_wiki_link.clone();
+            div()
+                .child(rtl)
+                .on_mouse_down(MouseButton::Left, move |ev: &MouseDownEvent, window, cx| {
+                    let Ok(ix) = hit.index_for_position(ev.position) else {
+                        return;
+                    };
+                    if let Some(k) = ranges.iter().position(|r| r.contains(&ix)) {
+                        cx.stop_propagation();
+                        follow_link(targets.get(k), &on_wiki, window, cx);
+                    }
+                })
+                .into_any_element()
+        };
+        (inner, layout)
     } else {
-        ctx.counter += 1;
-        let id = ElementId::Name(format!("{}-{}", ctx.id_base, ctx.counter).into());
-        let targets: Vec<LinkTarget> = inl.links.into_iter().map(|(_, t)| t).collect();
-        let on_wiki = ctx.on_wiki_link.clone();
-        InteractiveText::new(id, styled)
-            .on_click(link_ranges.clone(), move |ix, window, cx| {
-                // The click was on a link range; consume it so it doesn't also reach
-                // a surrounding host handler (e.g. the click-to-caret below).
-                cx.stop_propagation();
-                match targets.get(ix) {
-                    Some(LinkTarget::Wiki(title)) => {
-                        if let Some(handler) = &on_wiki {
-                            handler(title.clone(), window, cx);
-                        }
-                    }
-                    // Only http(s) reaches the OS opener — the markdown is
-                    // untrusted, and `open_url` runs the scheme's handler.
-                    Some(LinkTarget::Url(url)) if crate::syntax::is_safe_external_url(url) => {
-                        cx.open_url(url)
-                    }
-                    Some(LinkTarget::Url(_)) => {}
-                    None => {}
-                }
-            })
-            .into_any_element()
+        let styled = StyledText::new(inl.text).with_highlights(highlights);
+        // Capture the text layout (a shared handle, populated on paint) so a click can
+        // be mapped to a rendered byte index, then to a source offset (and so a canvas can paint
+        // inline formulas over their spacers).
+        let layout = TextHandle::Ltr(styled.layout().clone());
+        let inner = if link_ranges.is_empty() {
+            styled.into_any_element()
+        } else {
+            ctx.counter += 1;
+            let id = ElementId::Name(format!("{}-{}", ctx.id_base, ctx.counter).into());
+            let on_wiki = ctx.on_wiki_link.clone();
+            InteractiveText::new(id, styled)
+                .on_click(link_ranges.clone(), move |ix, window, cx| {
+                    // The click was on a link range; consume it so it doesn't also reach
+                    // a surrounding host handler (e.g. the click-to-caret below).
+                    cx.stop_propagation();
+                    follow_link(targets.get(ix), &on_wiki, window, cx);
+                })
+                .into_any_element()
+        };
+        (inner, layout)
     };
+    let layout = Rc::new(layout);
 
     // Click-to-caret: outside a link (link clicks `stop_propagation` above), map the
     // click to a source offset and report it so the host can place its editor caret
@@ -1794,14 +2154,14 @@ fn inline_element(nodes: &[mdast::Node], ctx: &mut Ctx) -> AnyElement {
         }
     };
     if math.is_empty() {
-        return el;
+        return align(el);
     }
     // A paragraph with inline formulas: paint each raster over its spacer via a canvas painted
     // AFTER the text (so the text layout is populated + gives the spacer's window position), and
     // grow the line height so a tall formula (a fraction) doesn't overlap the neighbouring line.
-    let tallest = math.iter().fold(0f32, |a, &(_, _, _, h, _)| a.max(h));
+    let tallest = math.iter().fold(0f32, |a, &(_, _, _, _, h, _)| a.max(h));
     let line_h = px((f32::from(ctx.style.text_size) * 1.4).max(tallest + 6.0));
-    div()
+    let with_math = div()
         .relative()
         .line_height(line_h)
         .child(el)
@@ -1812,8 +2172,8 @@ fn inline_element(nodes: &[mdast::Node], ctx: &mut Ctx) -> AnyElement {
                     let row_h = layout.line_height();
                     let mut hits = image_hits.borrow_mut();
                     hits.clear();
-                    for (off, img, w, h, src) in &math {
-                        if let Some(p) = layout.position_for_index(*off) {
+                    for (off, len, img, w, h, src) in &math {
+                        if let Some(p) = layout.raster_origin(*off..*off + *len) {
                             let y = p.y + (row_h - px(*h)) / 2.0;
                             let b = Bounds::new(point(p.x, y), size(px(*w), px(*h)));
                             let _ =
@@ -1828,7 +2188,8 @@ fn inline_element(nodes: &[mdast::Node], ctx: &mut Ctx) -> AnyElement {
             .absolute()
             .inset_0(),
         )
-        .into_any_element()
+        .into_any_element();
+    align(with_math)
 }
 
 fn build_inline(
@@ -1875,7 +2236,8 @@ fn build_inline(
                     Some((img, w, h)) => {
                         let space_w = (f32::from(style.text_size) * 0.26).max(1.0);
                         let n = ((w / space_w).ceil() as usize).max(1);
-                        out.math.push((out.text.len(), img, w, h, None));
+                        out.math
+                            .push((out.text.len(), n * '\u{00A0}'.len_utf8(), img, w, h, None));
                         out.text.extend(std::iter::repeat_n('\u{00A0}', n));
                     }
                     None => push_run(&format!("${}$", m.value), cur, out),
@@ -1911,8 +2273,14 @@ fn build_inline(
                     Some((raster, w, h)) => {
                         let space_w = (f32::from(style.text_size) * 0.26).max(1.0);
                         let n = ((w / space_w).ceil() as usize).max(1);
-                        out.math
-                            .push((out.text.len(), raster, w, h, Some(img.url.clone().into())));
+                        out.math.push((
+                            out.text.len(),
+                            n * '\u{00A0}'.len_utf8(),
+                            raster,
+                            w,
+                            h,
+                            Some(img.url.clone().into()),
+                        ));
                         out.text.extend(std::iter::repeat_n('\u{00A0}', n));
                     }
                     None => {
@@ -2273,7 +2641,12 @@ fn render_embed(
     ctx.on_image = ctx.on_embed_image.clone();
     ctx.embed_depth += 1;
     let mut body = div().flex().flex_col().gap(px(8.0));
-    if let Some(parsed) = parse_cached(&content)
+    // `parse_for_render`, not `parse_cached`: an embed of an expensive-shaped
+    // note would otherwise freeze the *embedding* page's render (issue #60).
+    // The host warms embedded bodies in `upsert_embed` alongside their images
+    // and math, so the fallback below is at most one frame.
+    let parsed = parse_for_render(&content);
+    if let Some(parsed) = &parsed
         && let mdast::Node::Root(root) = parsed.as_ref()
     {
         for node in &root.children {
@@ -2297,6 +2670,10 @@ fn render_embed(
                 body = body.child(el);
             }
         }
+    } else {
+        // Same fallback the top-level renderer uses: the text, unstyled, until
+        // the warm lands — never an empty box.
+        body = body.child(StyledText::new(content.clone()));
     }
     ctx.embed_depth -= 1;
     (
@@ -2560,6 +2937,13 @@ fn render_property_table(
         0.0
     };
     let key_cell_w = key_w + px(icon_indent + 20.0);
+    // The panel follows its VALUES, not its keys: a Persian note's property
+    // keys are usually Latin (`tags`, `key`), so keying off the line would leave
+    // an RTL note's properties reading the wrong way — and deciding per ROW
+    // would stagger the fixed-width key column.
+    let rtl = rows
+        .iter()
+        .any(|(_, v, _)| crate::syntax::content_direction(v).is_rtl());
     let key_col = ctx.style.muted_color;
     let tag_c = ctx.style.tag_color;
     let link_c = ctx.style.link_color;
@@ -2573,9 +2957,15 @@ fn render_property_table(
         let mut val = div()
             .flex()
             .flex_wrap()
+            // Segments read right-to-left. The cell does NOT grow in that case:
+            // the reversed row puts the key at the right edge and the value
+            // immediately beside it, whereas a growing cell would stretch to the
+            // far margin and strand the value there — which is not a `justify`
+            // that can be relied on to mean the same thing under row-reverse.
+            .when(rtl, |d| d.flex_row_reverse())
+            .when(!rtl, |d| d.flex_1())
             .items_center()
             .gap(px(5.0))
-            .flex_1()
             .px(px(8.0))
             .py(px(3.0));
         for seg in crate::syntax::property_value_segments(&value) {
@@ -2639,6 +3029,8 @@ fn render_property_table(
             .w(key_cell_w)
             .flex_shrink_0()
             .flex()
+            // The icon leads the key name, so it swaps sides too.
+            .when(rtl, |d| d.flex_row_reverse())
             .items_center()
             .gap(px(6.0))
             .px(px(8.0))
@@ -2666,6 +3058,8 @@ fn render_property_table(
         panel = panel.child(
             div()
                 .flex()
+                // Key on the right, value to its left.
+                .when(rtl, |d| d.flex_row_reverse())
                 .items_center()
                 .rounded(px(6.0))
                 .border_1()
@@ -2704,6 +3098,14 @@ fn render_table(
         .max()
         .unwrap_or(1)
         .max(1);
+    // An RTL table reads right-to-left: the first column sits on the RIGHT
+    // (#66). Direction from the table's source — pipes, dashes and digits are
+    // neutral under UAX #9, so the first strong character in a cell decides.
+    let rtl = table
+        .position
+        .as_ref()
+        .and_then(|p| ctx.source.get(p.start.offset..p.end.offset))
+        .is_some_and(|s| crate::syntax::content_direction(s).is_rtl());
     let base_font = window.text_style().font();
     let mut widths = vec![px(0.0); ncols];
     for (ri, row) in table.children.iter().enumerate() {
@@ -2774,7 +3176,12 @@ fn render_table(
         // The mdast table has no separator child: row 0 is the header, row 1 the
         // first body row (body_index 0).
         let body_index = ri.checked_sub(1);
-        let mut row_el = div().flex().flex_row();
+        // Reversing the row lays column 0 at the right without touching the
+        // width/alignment bookkeeping, which stays keyed by logical index.
+        let mut row_el = div()
+            .flex()
+            .when(rtl, |d| d.flex_row_reverse())
+            .when(!rtl, |d| d.flex_row());
         // Top divider: under every row (Grid), just under the header
         // (Striped/Minimal → the first body row's top), or never (Header).
         let top_divider = if row_lines {
@@ -2806,7 +3213,16 @@ fn render_table(
                 .min_h(px(f32::from(ctx.style.text_size) * 1.45 + 12.0))
                 .flex()
                 .items_center();
-            if vlines && ci + 1 < r.children.len() {
+            // Column separators sit between adjacent cells. Reversed, cell `i`
+            // is drawn LEFT of cell `i-1`, so the divider belongs on every
+            // cell except index 0 (the rightmost) — mirroring the LTR rule of
+            // "every cell except the last".
+            let needs_divider = if rtl {
+                ci > 0
+            } else {
+                ci + 1 < r.children.len()
+            };
+            if vlines && needs_divider {
                 cell_el = cell_el.border_r_1().border_color(border);
             }
             // Honor the column's GFM alignment (`:---:` / `---:`).
@@ -2830,7 +3246,10 @@ fn render_table(
         .id(("md-table", ctx.counter))
         // WYSIWYG indents tables into a 22px gutter (its row handles live
         // there); mirror it so the grid sits at the same x in both views.
-        .ml(px(22.0))
+        // An RTL table takes that gutter on its other side and hugs the right
+        // edge, where the rest of an RTL block starts.
+        .when(rtl, |d| d.mr(px(22.0)).ml_auto())
+        .when(!rtl, |d| d.ml(px(22.0)))
         .max_w_full()
         .overflow_x_scroll()
         .child(grid)
@@ -2992,7 +3411,8 @@ pub fn match_count(source: &str, query: &str) -> usize {
 /// The **block index** (top-level column-child index, as rendered) of each match of
 /// `query` in `source`, in document order. Pair with [`MarkdownView::track_blocks`]:
 /// the host reads `bounds_for_item(find_matches(..)[current])` to scroll the active
-/// match's block into view. Pure — parses the markdown, no I/O or storage.
+/// match's block into view. No I/O; shares the render path's memoized parse,
+/// so calling it per keystroke costs one parse, not one per character.
 pub fn find_matches(source: &str, query: &str) -> Vec<usize> {
     let mut out = Vec::new();
     if query.is_empty() {
@@ -3000,7 +3420,13 @@ pub fn find_matches(source: &str, query: &str) -> Vec<usize> {
     }
     let style = MarkdownStyle::default();
     let defs = HashMap::new();
-    if let Ok(mdast::Node::Root(root)) = markdown::to_mdast(source, &markdown::ParseOptions::gfm())
+    // The same cached tree `render` walks — keyed and normalized identically.
+    // Sharing it is what keeps a find-bar keystroke from re-parsing the page
+    // (issue #60: seconds, per character, on the shapes that go superlinear),
+    // and it makes the block indices below line up with the blocks actually
+    // rendered instead of a separately-parsed approximation.
+    if let Some(node) = parse_cached(&crate::syntax::normalize_math_fences(source))
+        && let mdast::Node::Root(root) = node.as_ref()
     {
         // Walk top-level blocks in render order, assigning each a column-child index
         // (only blocks that render to a child get one — same as `render`), and push
@@ -3436,8 +3862,15 @@ mod tests {
         assert!(crate::syntax::property("time:: 14:01 \r").is_some());
     }
 
+    /// The parse cache is process-global now, and `cargo test` runs these on
+    /// parallel threads — the tests that assert on cache identity or eviction
+    /// would otherwise evict each other's entries. Only they need the lock;
+    /// every other test just parses and uses the result.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn parse_cache_hits_and_evicts() {
+        let _serial = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Same source → the same cached tree (pointer-equal Arc).
         let a1 = parse_cached("# cache me\n\n- item").unwrap();
         let a2 = parse_cached("# cache me\n\n- item").unwrap();
@@ -3459,6 +3892,68 @@ mod tests {
             panic!("root")
         };
         assert!(matches!(root.children.first(), Some(mdast::Node::Math(_))));
+    }
+
+    #[test]
+    fn cheap_parse_scan_classifies_shapes() {
+        // A big note of ordinary prose still parses inline — it's linear, and
+        // no first frame of raw text for a note anyone actually wrote.
+        let prose = "Some prose with a [link](x) and *emphasis*.\n\n".repeat(1_000);
+        assert!(prose.len() > 40_000);
+        assert!(is_cheap_to_parse(&prose));
+        // A pasted CSV-sized table does not.
+        let table = format!(
+            "| a | b |\n|---|---|\n{}",
+            "| one | two |\n".repeat(MAX_TABLE_ROWS + 1)
+        );
+        assert!(!is_cheap_to_parse(&table));
+        // Deep blockquote nesting does not (6 s at 48 KB).
+        assert!(!is_cheap_to_parse(&format!("{}deep\n", "> ".repeat(5_000))));
+        // Nor a document of `[[[[[…` (unmatched brackets, however spread).
+        assert!(!is_cheap_to_parse(&format!(
+            "{}a\n",
+            "[".repeat(MAX_BRACKETS + 1)
+        )));
+        assert!(!is_cheap_to_parse(&"[[a\n".repeat(MAX_BRACKETS)));
+        // No false positive on ordinary quoting: an alert, a nested reply
+        // chain, a short table, and the wiki/embed/footnote bracket forms.
+        let normal = "> [!NOTE]\n> heads up\n\n> quoted\n> > nested\n> > > deeper\n\n\
+             See [[Page]], ![[Page#^ab12]], [^1] and [text](url).\n\n\
+             | a | b |\n|---|---|\n| 1 | 2 |\n";
+        assert!(is_cheap_to_parse(normal));
+        // Many small tables are cheap even though their rows outnumber one
+        // pasted CSV: the superlinear cost lives inside a single table.
+        let many = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\nbetween\n\n".repeat(200);
+        assert!(is_cheap_to_parse(&many));
+        // Emphasis that never resolves is the shape with no other tell: no
+        // brackets, quotes or tables, and under the size cap, yet 2.6 s.
+        let unresolved = format!("{}a{}", "*_".repeat(15_000), "_*".repeat(15_000));
+        assert!(unresolved.len() < INLINE_PARSE_MAX);
+        assert!(!is_cheap_to_parse(&unresolved));
+        // But ordinary formatting stays inline — it pairs up, so it's linear.
+        assert!(is_cheap_to_parse(
+            &"Some *bold* and _italic_ text.\n\n".repeat(500)
+        ));
+    }
+
+    #[test]
+    fn warm_parse_crosses_threads() {
+        let _serial = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Expensive-shaped, so the render path refuses to parse it inline.
+        let source = format!(
+            "| a | b |\n|---|---|\n{}",
+            "| one | two |\n".repeat(MAX_TABLE_ROWS + 1)
+        );
+        assert!(needs_warm(&source));
+        assert!(parse_for_render(&source).is_none());
+        // Warming on another thread fills the shared cache…
+        let warmed = source.clone();
+        std::thread::spawn(move || warm_parse(&warmed))
+            .join()
+            .unwrap();
+        // …and this thread now renders the real tree.
+        assert!(!needs_warm(&source));
+        assert!(parse_for_render(&source).is_some());
     }
 
     #[test]

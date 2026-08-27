@@ -12,7 +12,7 @@ name = "zorite"
 path = "src/main.rs"
 
 [workspace]
-members = ["crates/gpui-editor", "crates/gpui-markdown", "crates/gpui-pdf", "crates/gpui-whiteboard", "crates/os-cursors", "crates/os-spellcheck", "crates/ratex-gpui"]
+members = ["crates/gpui-bidi", "crates/gpui-editor", "crates/gpui-markdown", "crates/gpui-pdf", "crates/gpui-whiteboard", "crates/os-cursors", "crates/os-spellcheck", "crates/ratex-gpui"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -102,6 +102,13 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"]
 # enables `OffsetDateTime::now_local()` so "today" follows the user's
 # timezone rather than UTC. Same dep etch341 uses.
 time = { version = "0.3", features = ["local-offset"] }
+
+# Localization: compile-time-embedded YAML catalogs (one per locale) read by
+# the `t!()` macro, plus the OS locale for the Settings -> Language "Auto"
+# default. Both are already in the lockfile transitively, so this adds no new
+# download. `t!` lives only in the app - crates stay host-agnostic.
+rust-i18n = "4"
+sys-locale = "0.3"
 
 log = "0.4"
 env_logger = "0.11"

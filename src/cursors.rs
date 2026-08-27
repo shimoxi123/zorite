@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use os_cursors::{Cursor, Image, xcursor};
+use rust_i18n::t;
 
 /// The pack compiled into the binary (assets/cursors/), always offered.
 pub const BUNDLED: &str = "Bibata-Catppuccin-Mocha";
@@ -324,7 +325,7 @@ fn rasterize(svg: &str, hotspot64: (f32, f32)) -> Option<Vec<Image>> {
         );
         // tiny-skia's premultiplied RGBA → the crate's premultiplied BGRA.
         let mut bgra = pixmap.take();
-        for px in bgra.chunks_exact_mut(4) {
+        for px in bgra.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         frames.push(Image {
@@ -436,7 +437,7 @@ pub fn import(path: &Path) -> Result<String, String> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or("Pick the theme's folder.")?
+        .ok_or(t!("cursors.pick_folder"))?
         .to_string();
     let raster_src = path.join("cursors");
     let svg_src = path.join("svg");

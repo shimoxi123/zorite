@@ -25,6 +25,9 @@ pub enum Atom {
     SupSub { sup: Option<Row>, sub: Option<Row> },
     /// `\sqrt{radicand}` or `\sqrt[index]{radicand}`.
     Sqrt { radicand: Row, index: Option<Row> },
+    /// An accent over an editable base: `\hat{base}`, `\bar{base}`, `\vec{base}`, ….
+    /// `accent` is the command (`"\\hat"`).
+    Accent { accent: String, base: Row },
     /// Auto-growing delimiters: `\left<open> body \right<close>`.
     Delim {
         open: String,
@@ -69,6 +72,10 @@ impl Row {
 impl Atom {
     pub fn to_latex(&self) -> String {
         match self {
+            // A bare brace is TeX group syntax, not a glyph — escape it so a stray
+            // `{` Sym can never emit an unbalanced group (#77).
+            Atom::Sym(s) if s == "{" => r"\{".to_string(),
+            Atom::Sym(s) if s == "}" => r"\}".to_string(),
             Atom::Sym(s) => s.clone(),
             Atom::Frac { num, den } => {
                 format!(r"\frac{{{}}}{{{}}}", num.to_latex(), den.to_latex())
@@ -89,6 +96,7 @@ impl Atom {
                 Some(idx) => format!(r"\sqrt[{}]{{{}}}", idx.to_latex(), radicand.to_latex()),
                 None => format!(r"\sqrt{{{}}}", radicand.to_latex()),
             },
+            Atom::Accent { accent, base } => format!("{}{{{}}}", accent, base.to_latex()),
             Atom::Delim { open, body, close } => {
                 format!(r"\left{} {} \right{}", open, body.to_latex(), close)
             }
@@ -192,6 +200,25 @@ mod tests {
             index: Some(Row::syms("3")),
         };
         assert_eq!(s.to_latex(), r"\sqrt[3]{x}");
+    }
+
+    #[test]
+    fn accent_wraps_its_base() {
+        let a = Atom::Accent {
+            accent: r"\hat".into(),
+            base: Row::syms("X"),
+        };
+        assert_eq!(a.to_latex(), r"\hat{X}");
+        let nodes = ratex_parser::parse(&a.to_latex()).expect("RaTeX parses accents");
+        let lbox = ratex_layout::layout(&nodes, &ratex_layout::LayoutOptions::default());
+        assert!(lbox.width > 0.0);
+    }
+
+    #[test]
+    fn bare_brace_syms_escape() {
+        // A stray brace Sym must never emit TeX group syntax (#77).
+        assert_eq!(Atom::Sym("{".into()).to_latex(), r"\{");
+        assert_eq!(Atom::Sym("}".into()).to_latex(), r"\}");
     }
 
     #[test]

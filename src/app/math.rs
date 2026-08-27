@@ -126,11 +126,11 @@ impl AppView {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
             let result = ratex_gpui::render::render_latex_to_png(&source, 48.0, 4.0)
-                .ok_or_else(|| "the formula didn’t render".to_string())
+                .ok_or_else(|| t!("math.error").into_owned())
                 .and_then(|png| std::fs::write(&path, png).map_err(|e| e.to_string()));
             if let Err(e) = result {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.show_error_dialog("Export failed", e, window, cx);
+                    this.show_error_dialog(t!("math.export_failed"), e, window, cx);
                 });
             }
         })
@@ -146,11 +146,11 @@ impl AppView {
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = rx.await else { return };
             let result = ratex_gpui::render::render_latex_to_svg(&source, 48.0)
-                .ok_or_else(|| "the formula didn’t render".to_string())
+                .ok_or_else(|| t!("math.error").into_owned())
                 .and_then(|svg| std::fs::write(&path, svg).map_err(|e| e.to_string()));
             if let Err(e) = result {
                 let _ = this.update_in(cx, |this, window, cx| {
-                    this.show_error_dialog("Export failed", e, window, cx);
+                    this.show_error_dialog(t!("math.export_failed"), e, window, cx);
                 });
             }
         })
@@ -224,8 +224,19 @@ impl AppView {
         // Seat the editor: an inline `$…$` overlays the formula's spot (surrounding text stays
         // put); a `$$` block reserves a full-width gap at its row, sized to the cached render.
         if inline {
+            // Align the editor's glyphs with the displayed formula's: the editor pads
+            // its raster PAD px at text size, but the display raster's PAD was baked
+            // at the block em (FONT_SIZE) and scaled down — without compensation the
+            // formula shifts down/right by the difference on entering edit (#77).
+            let pad_delta =
+                ratex_gpui::render::PAD * (self.text_size / crate::math::FONT_SIZE - 1.0);
             source.update(cx, |e, cx| {
-                e.set_editing_inline(range, editor.clone().into(), cx)
+                e.set_editing_inline(
+                    range,
+                    editor.clone().into(),
+                    gpui::point(gpui::px(pad_delta), gpui::px(pad_delta)),
+                    cx,
+                )
             });
         } else {
             let height = self
@@ -416,7 +427,35 @@ impl AppView {
     /// same line; a `$$` block seats it on the adjacent line.
     fn exit_math_edit(&mut self, after: bool, window: &mut Window, cx: &mut Context<Self>) {
         let inline = self.math_edit.as_ref().is_some_and(|m| m.inline);
+        // A `$$` block with nothing above it (document start, or only its own
+        // `<!-- math:ALIGN -->` marker): exiting "before" would seat the text caret
+        // on the opening fence row and reveal the raw source — stay in the formula.
+        if !after
+            && !inline
+            && let Some(edit) = self.math_edit.as_ref()
+            && let Some(range) = edit.source.read(cx).editing_block_range()
+        {
+            let text = edit.source.read(cx).value();
+            let above = text[..range.start.min(text.len())].trim_end_matches('\n');
+            if above.is_empty() || (!above.contains('\n') && above.starts_with("<!-- math:")) {
+                return;
+            }
+        }
         if let Some((source, block)) = self.commit_math_edit(cx) {
+            // ratex-gpui reports the arrow it was handed — left/up = before the
+            // span, right/down = after — which is the left-to-right reading. On
+            // an RTL line the text continues LEFTWARD, so exiting left means
+            // landing AFTER the span; without this the caret leaves a formula
+            // on the wrong side and appears not to exit at all (#66). The crate
+            // stays host-agnostic, so direction is decided here.
+            let after = {
+                let text = source.read(cx).value();
+                if line_is_rtl(&text, block.start) {
+                    !after
+                } else {
+                    after
+                }
+            };
             source.update(cx, |e, cx| {
                 if inline {
                     e.focus(window, cx);
@@ -442,4 +481,13 @@ impl AppView {
             self.ensure_math_loaded(source, cx);
         }
     }
+}
+
+/// Does the line containing byte `at` read right-to-left? Same rule the editor
+/// and reader use — the line's first strong character.
+fn line_is_rtl(text: &str, at: usize) -> bool {
+    let at = at.min(text.len());
+    let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+    gpui_markdown::syntax::content_direction(&text[start..end]).is_rtl()
 }

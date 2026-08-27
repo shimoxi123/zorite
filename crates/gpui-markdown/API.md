@@ -36,7 +36,12 @@ isn't public. Feature `—` = always compiled (`gpui_markdown::syntax`);
 | [`heading_scale`](#heading_scale) | fn | `fn heading_scale(depth: u8) -> f32` | Font-size multiplier for h1–h6 | — |
 | [`ordered_marker`](#ordered_marker) | fn | `fn ordered_marker(depth: usize, n: u32) -> String` | Word-style list marker (`1.` → `a.` → `i.`) | — |
 | [`LinkHit`](#enum-linkhit) | enum | `Page(String) \| Url(String)` | What a clicked link-like construct targets | — |
-| [`is_safe_external_url`](#is_safe_external_url) | fn | `fn is_safe_external_url(url: &str) -> bool` | May this URL reach the OS opener? (http/https only) | — |
+| [`is_safe_external_url`](#is_safe_external_url) | fn | `fn is_safe_external_url(url: &str) -> bool` | May this URL reach the OS opener? (http/https/mailto only) | — |
+| [`Direction`](#base_direction) | enum | `Ltr \| Rtl` | A block's base writing direction | — |
+| [`base_direction`](#base_direction) | fn | `fn base_direction(text: &str) -> Direction` | First-strong-character direction (UAX #9 P2/P3) | — |
+| [`content_direction`](#content_direction) | fn | `fn content_direction(line: &str) -> Direction` | Direction of a markdown line's CONTENT, ignoring its markers | — |
+| [`content_direction_opt`](#content_direction) | fn | `fn content_direction_opt(line: &str) -> Option<Direction>` | Same, `None` when the line has no strong character | — |
+| [`contains_rtl`](#contains_rtl) | fn | `fn contains_rtl(text: &str) -> bool` | Does the text hold ANY right-to-left character? | — |
 | [`wiki_target_display`](#wiki_target_display) | fn | `fn wiki_target_display(inner: &str) -> (&str, &str)` | Split `target\|label` into `(target, display)` | — |
 | [`is_tag_char`](#is_tag_char--is_word_char) | fn | `fn is_tag_char(c: u8) -> bool` | Byte valid inside a `#tag` name | — |
 | [`is_word_char`](#is_tag_char--is_word_char) | fn | `fn is_word_char(c: u8) -> bool` | Word byte for boundary checks | — |
@@ -102,6 +107,8 @@ isn't public. Feature `—` = always compiled (`gpui_markdown::syntax`);
 | [`toggle_task_at`](#toggle_task_at) | fn | `fn toggle_task_at(content: &str, offset: usize) -> Option<String>` | Flip the `[ ]`↔`[x]` on the line at `offset` | `view` |
 | [`match_count`](#match_count) | fn | `fn match_count(source: &str, query: &str) -> usize` | In-page find: total matches | `view` |
 | [`find_matches`](#find_matches) | fn | `fn find_matches(source: &str, query: &str) -> Vec<usize>` | In-page find: block index per match, in order | `view` |
+| [`warm_parse`](#warm_parse) | fn | `fn warm_parse(source: &str)` | Fill the shared parse cache off the UI thread | `view` |
+| [`needs_warm`](#needs_warm) | fn | `fn needs_warm(source: &str) -> bool` | Would rendering `source` block on a parse? | `view` |
 | [`Snippet`](#struct-snippet-and-snippets) | struct | 3 pub fields | An authoring snippet (label, text, caret) | `view` |
 | [`SNIPPETS`](#struct-snippet-and-snippets) | const | `&[Snippet]` | Built-in markdown snippets for a `/` palette | `view` |
 | [`ListEdit`](#enum-listedit) | enum | `Continue(String) \| Exit { start, end }` | What Enter should do on a list/quote line | `view` |
@@ -427,6 +434,104 @@ What a click on a link-like construct targets.
 
 ---
 
+## `base_direction`
+
+```rust
+pub enum Direction { Ltr, Rtl }
+impl Direction { pub fn is_rtl(self) -> bool }
+
+pub fn base_direction(text: &str) -> Direction
+```
+
+A block's base writing direction, decided by its first **strong** directional
+character — Unicode UAX #9 rules P2/P3, the same rule browsers' `dir=auto` and
+Logseq use. Hosts apply it per block: the reader right-aligns RTL prose and
+flips the list-marker side.
+
+**Returns** — `Rtl` if the first strong character is Hebrew, Arabic (including
+Persian and Urdu), Syriac, Thaana, N'Ko, Samaritan, Mandaic, or an Arabic
+presentation form; `Ltr` otherwise, including for text with no strong
+character at all.
+
+**Guarantees & edge cases**
+
+- Neutrals are skipped, which is what makes it usable on raw markdown: list
+  markers, heading `#`s, quote `>`s, digits, punctuation, and whitespace all
+  pass through, so `- سلام` and `## سلام` both detect as `Rtl`.
+- The FIRST strong character wins, not the majority — `Rust سلام دنیا` is
+  `Ltr` and `سلام Rust` is `Rtl`. That's the rule that lets a mixed note put
+  each line in its own direction.
+- Empty or neutral-only text (`""`, `"123 — !?"`) is `Ltr`.
+- CJK, Cyrillic, Greek, and Indic scripts are `Ltr` (strong-LTR is
+  "alphabetic and not strong-RTL").
+- Script ranges, not a bidi-class table: the strong-RTL blocks are contiguous
+  and stable, and this predicate isn't worth a Unicode-table dependency.
+
+**Not** a bidi implementation. It gives a *paragraph* direction only. Mixed
+runs inside a line are reordered by the platform shaper (CoreText,
+cosmic-text), which already handles them correctly. gpui's `LineLayout`
+index↔x mapping does **not** — that is what the `gpui-bidi` crate exists for,
+and both this renderer and the editor go through it for caret placement,
+selection and hit-testing.
+
+**Use [`content_direction`](#content_direction) for a markdown source line.**
+Neutrals pass through here, but markdown supplies *strong* characters of its
+own: the `x` in `- [x]` and the label in `> [!NOTE]` are strong left-to-right,
+so a completed task and every alert read `Ltr` whatever their prose says.
+
+---
+
+## `content_direction`
+
+```rust
+pub fn content_direction(line: &str) -> Direction
+pub fn content_direction_opt(line: &str) -> Option<Direction>
+```
+
+The direction of a source line's **content**, with its markdown markers
+skipped: blockquote arrows, list bullets, ordered markers, task boxes, heading
+hashes, GitHub alert markers (`[!NOTE]`) and the Obsidian fold char after one.
+
+**Why it isn't [`base_direction`](#base_direction)** — that takes the first
+strong character, and markers can supply one. The `x` in `- [x] یک کار` and the
+`N` in `> [!NOTE]` are both strong left-to-right, so a completed task read
+`Ltr` while the identical unchecked line read `Rtl`, and the two sat on
+opposite sides of the note.
+
+**`_opt` and the `None` case** — a line can have no direction of its own: it is
+blank, or nothing but markers. `> [!NOTE]` strips to nothing. Answering `Ltr`
+there put a callout's title on one side and its body on the other, so callers
+that care take the surrounding text's direction instead. `content_direction`
+flattens `None` to `Ltr` for callers that don't.
+
+**Guarantees & edge cases**
+
+- Markers are stripped repeatedly, so nested forms work: `> - [ ] متن`.
+- Latin content still reads `Ltr`, markers or not.
+- What remains after stripping is passed to [`base_direction`](#base_direction),
+  so all of its rules (first strong wins, neutrals skipped) apply to it.
+
+---
+
+## `contains_rtl`
+
+```rust
+pub fn contains_rtl(text: &str) -> bool
+```
+
+Whether `text` holds **any** right-to-left character.
+
+Distinct from [`base_direction`](#base_direction), which answers which side a
+line starts on. A line can read left-to-right and still hold a Persian name in
+the middle, and that run needs the same logical↔visual mapping an RTL line
+does — the caret misplaces inside it otherwise. Both views use this to decide
+whether a line needs bidi layout at all, while `base_direction` decides which
+way it aligns.
+
+**Cost** — one pass over the chars, early-exit on the first hit; no allocation.
+
+---
+
 ## `is_safe_external_url`
 
 ```rust
@@ -440,8 +545,11 @@ handler owns the scheme: `file:` launches local content, `smb:` leaks NTLM
 hashes on Windows, `javascript:`/`data:`/app-registered schemes (`ms-msdt:` …)
 run code. So this is an **allowlist**, not a denylist.
 
-**Returns** — `true` only for `http://` and `https://`. The scheme is compared
-case-insensitively (RFC 3986), so `HTTPS://` passes.
+**Returns** — `true` only for `http://`, `https://`, and `mailto:`. The scheme
+is compared case-insensitively (RFC 3986), so `HTTPS://` passes. `mailto:` is
+allowed because `[write us](mailto:x@y.com)` is ordinary markdown and it opens
+a compose window rather than running anything; the mail client owns parsing
+its query.
 
 **Guarantees & edge cases**
 
@@ -1527,7 +1635,53 @@ of `query` in `source`, in document order — one entry per match, so
   `[!NOTE]` doesn't match; a `[[wiki|alias]]`'s alias does), case-insensitive.
 - Empty query → empty vec.
 
-**Cost & threading** — pure; parses the markdown (uncached), no I/O.
+**Cost & threading** — no I/O; shares `render`'s memoized parse of the same
+source, so a find bar calling it per keystroke pays for one parse, not one
+per character.
+
+---
+
+## `warm_parse`
+
+```rust
+pub fn warm_parse(source: &str)
+```
+
+Parse `source` into the crate's shared parse cache unless it's already there,
+so a later [`MarkdownView`](#struct-markdownview) render finds a tree instead
+of having to build one.
+
+**Guarantees & edge cases** — the cache key is the exact source string,
+normalized the same way `render` normalizes it, so what this warms is what
+renders. Unparseable source is a no-op (nothing is cached). Idempotent.
+
+**Cost & threading** — the parse itself, which is superlinear on some shapes
+(a huge pasted table, runaway blockquote nesting): **call it off the UI
+thread** — that is the entire point. Pure and gpui-free, so any thread will
+do; the cache is process-global and internally locked, and the lock is never
+held across a parse.
+
+---
+
+## `needs_warm`
+
+```rust
+pub fn needs_warm(source: &str) -> bool
+```
+
+Whether rendering `source` would block on a parse — i.e. it is
+expensive-shaped **and** not cached yet. Hosts check this before spawning a
+[`warm_parse`](#warm_parse) task; an ordinary note answers `false` and needs
+no task, since `render` parses cheap shapes inline as it always has.
+
+**Guarantees & edge cases** — "expensive-shaped" is a linear pre-scan
+(document size, blockquote nesting depth, total `[` count, rows in a single
+table, total `*`/`_` count),
+deliberately conservative: a false positive costs one frame of plain text,
+never a refused document. `false` after a successful `warm_parse` of the same
+source, until that entry is evicted (the cache is LRU-capped at 64 entries).
+
+**Cost & threading** — one linear pass plus a cache lookup; any thread.
 
 ---
 

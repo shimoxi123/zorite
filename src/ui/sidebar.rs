@@ -19,10 +19,11 @@ use crate::app::AppView;
 use crate::hierarchy::{self, PageNode};
 use crate::models::Page;
 use crate::theme;
+use rust_i18n::t;
 
 pub fn render(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> impl IntoElement {
     if app.sidebar_collapsed {
-        collapsed_rail(cx).into_any_element()
+        collapsed_rail(app.sidebar_right, cx).into_any_element()
     } else {
         expanded(app, window, cx).into_any_element()
     }
@@ -73,9 +74,9 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
     let fav_collapsed = app.is_section_collapsed("favorites");
     let wb_collapsed = app.is_section_collapsed("whiteboards");
     let recent_collapsed = app.is_section_collapsed("recent");
-    let fav_header = section_header("Favorites", "favorites", fav_collapsed, cx);
-    let wb_header = section_header("Whiteboards", "whiteboards", wb_collapsed, cx);
-    let recent_header = section_header("Recent", "recent", recent_collapsed, cx);
+    let fav_header = section_header(&t!("sidebar.favorites"), "favorites", fav_collapsed, cx);
+    let wb_header = section_header(&t!("sidebar.whiteboards"), "whiteboards", wb_collapsed, cx);
+    let recent_header = section_header(&t!("sidebar.recent"), "recent", recent_collapsed, cx);
 
     div()
         .w(px(240.0))
@@ -84,7 +85,15 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
         .flex()
         .flex_col()
         .bg(theme::bg_sidebar())
-        .border_r_1()
+        // The border faces the content: right edge when the sidebar docks
+        // left (the default), left edge when it docks right.
+        .map(|el| {
+            if app.sidebar_right {
+                el.border_l_1()
+            } else {
+                el.border_r_1()
+            }
+        })
         .border_color(theme::border_subtle())
         .child(
             // Header: the collapse caret on the left, the jump-to-date and
@@ -101,9 +110,12 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
                     div()
                         .flex()
                         .flex_row()
+                        // Docked right, the header mirrors: caret at the outer
+                        // (right) edge, the icon cluster inward.
+                        .when(app.sidebar_right, |el| el.flex_row_reverse())
                         .items_center()
                         .justify_between()
-                        .child(collapse_caret(cx))
+                        .child(collapse_caret(app.sidebar_right, cx))
                         .child(
                             div()
                                 .flex()
@@ -169,9 +181,9 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
                         .when(!recent_collapsed, |this| {
                             this.when(no_pages, |t| {
                                 t.child(empty_hint(if app.pages.is_empty() {
-                                    "No pages yet — right-click below to add one"
+                                    t!("sidebar.no_pages").into_owned()
                                 } else {
-                                    "No recent pages"
+                                    t!("sidebar.no_recent").into_owned()
                                 }))
                             })
                             .children(page_rows)
@@ -189,7 +201,7 @@ fn expanded(app: &AppView, window: &mut Window, cx: &mut Context<AppView>) -> im
                         .min_h(px(48.0))
                         .context_menu(|menu, _window, _cx| {
                             menu.menu_with_icon(
-                                "New page",
+                                t!("sidebar.new_page"),
                                 super::menu_icon("sticky-note-plus"),
                                 Box::new(NewPage),
                             )
@@ -208,7 +220,9 @@ fn notebook_footer(app: &AppView, cx: &mut Context<AppView>) -> impl IntoElement
     // on popover open and after mutations.
     let notebooks = &app.notebooks;
     let active = notebooks.iter().find(|n| n.is_active());
-    let name: SharedString = active.map_or("Main".to_string(), |n| n.name.clone()).into();
+    let name: SharedString = active
+        .map_or(t!("sidebar.main").into_owned(), |n| n.name.clone())
+        .into();
     let dir: SharedString = active.map(|n| n.dir.clone()).unwrap_or_default().into();
     let popover = app
         .notebook_popover
@@ -296,7 +310,7 @@ fn notebook_popover(notebooks: &[crate::paths::Notebook], cx: &mut Context<AppVi
                     .cursor_pointer()
                     .text_color(theme::text_secondary())
                     .hover(|h| h.bg(theme::hover()).text_color(theme::text_primary()))
-                    .child("Add notebook…")
+                    .child(t!("sidebar.add_notebook"))
                     .on_click(
                         cx.listener(|this: &mut AppView, _: &ClickEvent, window, cx| {
                             this.add_notebook_via_picker(window, cx);
@@ -350,7 +364,7 @@ fn notebook_row(nb: crate::paths::Notebook, cx: &mut Context<AppView>) -> AnyEle
                 .path("icons/pencil.svg")
                 .with_size(px(13.0))
                 .into_any_element(),
-            "Rename",
+            t!("sidebar.rename"),
             cx.listener(move |this: &mut AppView, _: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
                 this.rename_notebook_dialog(nb_rename.clone(), window, cx);
@@ -362,7 +376,7 @@ fn notebook_row(nb: crate::paths::Notebook, cx: &mut Context<AppView>) -> AnyEle
                 .path("icons/folder.svg")
                 .with_size(px(13.0))
                 .into_any_element(),
-            "Reveal folder",
+            t!("sidebar.reveal_folder"),
             cx.listener(move |this: &mut AppView, _: &MouseDownEvent, _window, cx| {
                 cx.stop_propagation();
                 this.reveal_notebook(nb_reveal.clone(), cx);
@@ -372,7 +386,7 @@ fn notebook_row(nb: crate::paths::Notebook, cx: &mut Context<AppView>) -> AnyEle
             d.child(row_btn(
                 ("nb-forget", nb.dir.clone()),
                 div().text_size(px(12.0)).child("✕").into_any_element(),
-                "Remove from list (keeps the files)",
+                t!("sidebar.remove_from_list"),
                 cx.listener(move |this: &mut AppView, _: &MouseDownEvent, _window, cx| {
                     cx.stop_propagation();
                     this.forget_notebook(nb_forget.clone(), cx);
@@ -392,9 +406,10 @@ fn notebook_row(nb: crate::paths::Notebook, cx: &mut Context<AppView>) -> AnyEle
 fn row_btn(
     id: (&'static str, String),
     face: AnyElement,
-    tip: &'static str,
+    tip: impl Into<SharedString>,
     handler: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
+    let tip = tip.into();
     div()
         .id(SharedString::from(format!("{}:{}", id.0, id.1)))
         .flex_shrink_0()
@@ -403,14 +418,14 @@ fn row_btn(
         .text_color(theme::text_tertiary())
         .hover(|h| h.bg(theme::hover()).text_color(theme::text_primary()))
         .child(face)
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
         .on_mouse_down(MouseButton::Left, handler)
         .into_any_element()
 }
 
 /// The collapsed sidebar: a thin icon rail with the expand caret (`>`) at the
 /// top, then the jump-to-date and settings icons.
-fn collapsed_rail(cx: &mut Context<AppView>) -> impl IntoElement {
+fn collapsed_rail(right: bool, cx: &mut Context<AppView>) -> impl IntoElement {
     div()
         .w(px(48.0))
         .h_full()
@@ -421,9 +436,15 @@ fn collapsed_rail(cx: &mut Context<AppView>) -> impl IntoElement {
         .gap_1()
         .pt_2()
         .bg(theme::bg_sidebar())
-        .border_r_1()
+        .map(|el| {
+            if right {
+                el.border_l_1()
+            } else {
+                el.border_r_1()
+            }
+        })
         .border_color(theme::border_subtle())
-        .child(expand_caret(cx))
+        .child(expand_caret(right, cx))
         .child(new_page_icon(cx))
         .child(all_pages_icon(cx))
         .child(date_icon(cx))
@@ -444,18 +465,30 @@ fn icon_btn(id: &'static str, icon: impl Into<Icon>) -> Stateful<Div> {
         .child(Icon::new(icon).size_4())
 }
 
-/// Collapse caret (`<`), in the expanded header — hides the sidebar to a rail.
-fn collapse_caret(cx: &mut Context<AppView>) -> impl IntoElement {
-    icon_btn("collapse-sidebar", IconName::ChevronLeft).on_click(cx.listener(
+/// Collapse caret, in the expanded header — hides the sidebar to a rail. It
+/// points toward the edge the sidebar retreats to (`<` left dock, `>` right).
+fn collapse_caret(right: bool, cx: &mut Context<AppView>) -> impl IntoElement {
+    let icon = if right {
+        IconName::ChevronRight
+    } else {
+        IconName::ChevronLeft
+    };
+    icon_btn("collapse-sidebar", icon).on_click(cx.listener(
         |this: &mut AppView, _: &ClickEvent, _window, cx| {
             this.toggle_sidebar(cx);
         },
     ))
 }
 
-/// Expand caret (`>`), at the top of the collapsed rail — reopens the sidebar.
-fn expand_caret(cx: &mut Context<AppView>) -> impl IntoElement {
-    icon_btn("expand-sidebar", IconName::ChevronRight).on_click(cx.listener(
+/// Expand caret, at the top of the collapsed rail — reopens the sidebar. It
+/// points back toward the content (`>` left dock, `<` right).
+fn expand_caret(right: bool, cx: &mut Context<AppView>) -> impl IntoElement {
+    let icon = if right {
+        IconName::ChevronLeft
+    } else {
+        IconName::ChevronRight
+    };
+    icon_btn("expand-sidebar", icon).on_click(cx.listener(
         |this: &mut AppView, _: &ClickEvent, _window, cx| {
             this.toggle_sidebar(cx);
         },
@@ -481,7 +514,9 @@ fn new_page_icon(cx: &mut Context<AppView>) -> impl IntoElement {
                 window.dispatch_action(Box::new(NewPage), cx);
             }),
         )
-        .tooltip(|window, cx| Tooltip::new("New page").build(window, cx))
+        .tooltip(|window, cx| {
+            Tooltip::new(SharedString::from(t!("sidebar.new_page"))).build(window, cx)
+        })
 }
 
 /// The "All pages" browser button — every named page and whiteboard in one
@@ -493,7 +528,9 @@ fn all_pages_icon(cx: &mut Context<AppView>) -> impl IntoElement {
                 this.open_all_pages(window, cx);
             }),
         )
-        .tooltip(|window, cx| Tooltip::new("All pages").build(window, cx))
+        .tooltip(|window, cx| {
+            Tooltip::new(SharedString::from(t!("sidebar.all_pages"))).build(window, cx)
+        })
 }
 
 /// The settings gear. Opens the Settings window (deferred — opening a window
@@ -544,7 +581,7 @@ fn journal_row(active: bool, cx: &mut Context<AppView>) -> impl IntoElement {
             d.text_color(theme::text_secondary())
                 .hover(|h| h.bg(theme::hover()).text_color(theme::text_primary()))
         })
-        .child("Journal")
+        .child(t!("sidebar.journal"))
         .on_click(
             cx.listener(|this: &mut AppView, _: &ClickEvent, window, cx| {
                 this.show_journal(window, cx);
@@ -745,7 +782,9 @@ fn new_whiteboard_icon(cx: &mut Context<AppView>) -> impl IntoElement {
             this.new_whiteboard(window, cx);
         }),
     )
-    .tooltip(|window, cx| Tooltip::new("New whiteboard").build(window, cx))
+    .tooltip(|window, cx| {
+        Tooltip::new(SharedString::from(t!("sidebar.new_whiteboard"))).build(window, cx)
+    })
 }
 
 /// Shared styling for a clickable sidebar page row (the caller chains `on_click`,
@@ -876,7 +915,7 @@ fn section_header(
         .into_any_element()
 }
 
-fn empty_hint(text: &str) -> impl IntoElement {
+fn empty_hint(text: String) -> impl IntoElement {
     div()
         .px_2()
         .py_1()

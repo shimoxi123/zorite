@@ -298,19 +298,19 @@ impl TurnKind {
         TurnKind::Math,
     ];
 
-    fn label(self) -> &'static str {
+    fn label(self, labels: &Labels) -> SharedString {
         match self {
-            TurnKind::Text => "Text",
-            TurnKind::H1 => "Heading 1",
-            TurnKind::H2 => "Heading 2",
-            TurnKind::H3 => "Heading 3",
-            TurnKind::Bullet => "Bulleted list",
-            TurnKind::Numbered => "Numbered list",
-            TurnKind::Todo => "To-do",
-            TurnKind::Quote => "Quote",
-            TurnKind::Callout => "Callout",
-            TurnKind::Code => "Code block",
-            TurnKind::Math => "Math block",
+            TurnKind::Text => labels.text.clone(),
+            TurnKind::H1 => labels.heading_1.clone(),
+            TurnKind::H2 => labels.heading_2.clone(),
+            TurnKind::H3 => labels.heading_3.clone(),
+            TurnKind::Bullet => labels.bulleted_list.clone(),
+            TurnKind::Numbered => labels.numbered_list.clone(),
+            TurnKind::Todo => labels.todo.clone(),
+            TurnKind::Quote => labels.quote.clone(),
+            TurnKind::Callout => labels.callout.clone(),
+            TurnKind::Code => labels.code_block.clone(),
+            TurnKind::Math => labels.math_block.clone(),
         }
     }
 }
@@ -608,6 +608,101 @@ pub fn inline_math_sources(content: &str) -> Vec<SharedString> {
 /// cached layout (the wrapped lines from the last paint) for hit-testing + IME.
 /// Renders the WYSIWYG view when a markdown [`SyntaxStyle`] is installed, the
 /// raw-markdown view otherwise.
+/// Host-injectable UI labels the editor renders in its context menus and
+/// chrome (right-click menu items, the code-block / math `Copy` chips, the
+/// table / "Turn into" menus). The crate stays host-agnostic so it never
+/// calls `t!()`; the app passes localized strings here via
+/// [`EditorState::set_labels`]. The default is English, keeping the crate
+/// usable standalone (and existing tests' expectations intact).
+#[derive(Clone)]
+pub struct Labels {
+    /// Text-selection right-click menu.
+    pub cut: SharedString,
+    pub copy: SharedString,
+    pub copy_as_markdown: SharedString,
+    pub paste: SharedString,
+    /// Code-block / formula chrome.
+    pub code_copy: SharedString,
+    pub math_copy: SharedString,
+    /// "Turn into" block-conversion menu.
+    pub turn_into: SharedString,
+    pub text: SharedString,
+    pub heading_1: SharedString,
+    pub heading_2: SharedString,
+    pub heading_3: SharedString,
+    pub bulleted_list: SharedString,
+    pub numbered_list: SharedString,
+    pub todo: SharedString,
+    pub quote: SharedString,
+    pub callout: SharedString,
+    pub code_block: SharedString,
+    pub math_block: SharedString,
+    /// Table right-click menu.
+    pub insert_row_above: SharedString,
+    pub insert_row_below: SharedString,
+    pub duplicate_row: SharedString,
+    pub insert_column_left: SharedString,
+    pub insert_column_right: SharedString,
+    pub align_left: SharedString,
+    pub align_center: SharedString,
+    pub align_right: SharedString,
+    pub grid_style: SharedString,
+    pub striped_style: SharedString,
+    pub header_style: SharedString,
+    pub minimal_style: SharedString,
+    pub delete_row: SharedString,
+    pub delete_column: SharedString,
+    pub delete_table: SharedString,
+    /// Property-panel menu.
+    pub edit_properties: SharedString,
+    pub delete_property: SharedString,
+    /// Image menu.
+    pub delete_image: SharedString,
+}
+
+impl Default for Labels {
+    fn default() -> Self {
+        Self {
+            cut: "Cut".into(),
+            copy: "Copy".into(),
+            copy_as_markdown: "Copy as Markdown".into(),
+            paste: "Paste".into(),
+            code_copy: "Copy".into(),
+            math_copy: "Copy".into(),
+            turn_into: "Turn into".into(),
+            text: "Text".into(),
+            heading_1: "Heading 1".into(),
+            heading_2: "Heading 2".into(),
+            heading_3: "Heading 3".into(),
+            bulleted_list: "Bulleted list".into(),
+            numbered_list: "Numbered list".into(),
+            todo: "To-do".into(),
+            quote: "Quote".into(),
+            callout: "Callout".into(),
+            code_block: "Code block".into(),
+            math_block: "Math block".into(),
+            insert_row_above: "Insert row above".into(),
+            insert_row_below: "Insert row below".into(),
+            duplicate_row: "Duplicate row".into(),
+            insert_column_left: "Insert column left".into(),
+            insert_column_right: "Insert column right".into(),
+            align_left: "Align left".into(),
+            align_center: "Align center".into(),
+            align_right: "Align right".into(),
+            grid_style: "Grid style".into(),
+            striped_style: "Striped style".into(),
+            header_style: "Header style".into(),
+            minimal_style: "Minimal style".into(),
+            delete_row: "Delete row".into(),
+            delete_column: "Delete column".into(),
+            delete_table: "Delete table".into(),
+            edit_properties: "Edit properties".into(),
+            delete_property: "Delete property".into(),
+            delete_image: "Delete image".into(),
+        }
+    }
+}
+
 pub struct EditorState {
     focus_handle: FocusHandle,
     /// The whole document, newline-separated. Byte offsets index into this.
@@ -672,6 +767,9 @@ pub struct EditorState {
     /// inset): non-zero for fenced code blocks and gutter marks (blockquotes,
     /// lists). From the last paint.
     line_insets: Vec<Pixels>,
+    /// Per-logical-line right-to-left geometry (#66), `None` on every LTR row
+    /// so an LTR document pays nothing. From the last paint. See [`RtlRow`].
+    rtl_rows: Vec<Option<RtlRow>>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     /// Font size from the last paint. Hit-testing that runs during event
@@ -705,6 +803,9 @@ pub struct EditorState {
     /// view (W1), `None` = the raw view (plain text). Set by the host via
     /// [`Self::set_markdown_style`].
     markdown_style: Option<SyntaxStyle>,
+    /// Host-injectable UI labels for context menus / chrome; English by
+    /// default, localized through [`Self::set_labels`].
+    labels: Labels,
     /// The open right-click suggestions menu, if any.
     menu: Option<DiagMenu>,
     /// The open table right-click menu's anchor (window space), if any. Its actions
@@ -893,6 +994,11 @@ struct EditingBlock {
 struct EditingInline {
     range: Range<usize>,
     view: gpui::AnyView,
+    /// Where the view's top-left sits relative to the formula raster's top-left. The
+    /// host's editor view pads its raster differently than the display raster (whose
+    /// padding was baked at the block em and scaled down), so a zero offset shifts
+    /// the glyphs visibly on entering edit.
+    offset: Point<Pixels>,
 }
 
 impl EditorState {
@@ -913,6 +1019,7 @@ impl EditorState {
             widget_rows: Vec::new(),
             offset_maps: Vec::new(),
             line_insets: Vec::new(),
+            rtl_rows: Vec::new(),
             table_rows: Vec::new(),
             table_row_add_rects: Vec::new(),
             table_col_add_rects: Vec::new(),
@@ -934,6 +1041,7 @@ impl EditorState {
             goal_x: None,
             diagnostics: Vec::new(),
             markdown_style: None,
+            labels: Labels::default(),
             menu: None,
             table_menu: None,
             table_menu_scroll: ScrollHandle::new(),
@@ -1090,6 +1198,13 @@ impl EditorState {
 
     pub fn set_markdown_style(&mut self, style: SyntaxStyle, cx: &mut Context<Self>) {
         self.markdown_style = Some(style);
+        cx.notify();
+    }
+
+    /// Set the host-localized labels for the context menus / chrome. Replace
+    /// on every language switch so the current editors pick it up.
+    pub fn set_labels(&mut self, labels: Labels, cx: &mut Context<Self>) {
+        self.labels = labels;
         cx.notify();
     }
 
@@ -1289,6 +1404,13 @@ impl EditorState {
         cx.notify();
     }
 
+    /// The byte range of the block currently being structurally edited (the range handed
+    /// to [`Self::set_editing_block`] — the source text is untouched while the edit is
+    /// open, so it stays valid). `None` when no block edit is open.
+    pub fn editing_block_range(&self) -> Option<Range<usize>> {
+        self.editing_block.as_ref().map(|eb| eb.range.clone())
+    }
+
     /// End an in-line math edit (the host has committed / cancelled). Returns the block's
     /// byte range, so the host can overwrite it.
     pub fn end_editing_block(&mut self, cx: &mut Context<Self>) -> Option<Range<usize>> {
@@ -1299,13 +1421,20 @@ impl EditorState {
 
     /// Begin a structural edit of the inline `$…$` span at `range` (absolute bytes): overlay
     /// `view` (the host's editor) at the formula's painted spot. The host focuses `view`.
+    /// `offset` places the view relative to the raster's top-left, letting the host
+    /// align the view's glyphs with the displayed formula's (their paddings differ).
     pub fn set_editing_inline(
         &mut self,
         range: Range<usize>,
         view: gpui::AnyView,
+        offset: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.editing_inline = Some(EditingInline { range, view });
+        self.editing_inline = Some(EditingInline {
+            range,
+            view,
+            offset,
+        });
         cx.notify();
     }
 
@@ -1505,8 +1634,8 @@ impl EditorState {
         Some(
             div()
                 .absolute()
-                .top(rect.origin.y - origin.y)
-                .left(rect.origin.x - origin.x)
+                .top(rect.origin.y - origin.y + ei.offset.y)
+                .left(rect.origin.x - origin.x + ei.offset.x)
                 .occlude()
                 .child(ei.view.clone()),
         )
@@ -1609,6 +1738,127 @@ impl EditorState {
         self.line_insets.get(row).copied().unwrap_or(px(0.))
     }
 
+    /// The right-align shift of an RTL row (zero everywhere else) — see
+    /// [`RtlRow::shift`].
+    fn rtl_shift(&self, row: usize) -> Pixels {
+        self.rtl_rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .and_then(|r| r.shifts.first().copied())
+            .unwrap_or(px(0.))
+    }
+
+    /// Where logical line `row`'s painted text actually starts: its inset plus
+    /// the right-align shift of an RTL row (#66). Everything that positions
+    /// against a row's text — caret, click, selection, link boxes — goes
+    /// through this, so the two can never drift apart.
+    fn row_origin_x(&self, row: usize) -> Pixels {
+        self.line_inset(row) + self.rtl_shift(row)
+    }
+
+    /// Does the caret's TABLE row read right-to-left? Cells step through their
+    /// own stepper, which walks in logical order — so on an RTL table the
+    /// visual arrows map to the opposite step.
+    fn caret_table_is_rtl(&self) -> bool {
+        let (row, _) = self.row_col(self.cursor_offset());
+        self.table_rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .is_some_and(|t| t.rtl)
+    }
+
+    /// Does the caret's line read right-to-left?
+    ///
+    /// Arrow keys move VISUALLY — Right steps to the character on the right of
+    /// the screen, which every platform does in bidi text and which readers of
+    /// Persian expect. On an RTL row that character is the logically PREVIOUS
+    /// one, so the two step functions swap.
+    fn caret_row_is_rtl(&self) -> bool {
+        let (row, _) = self.row_col(self.cursor_offset());
+        self.rtl_rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .is_some_and(|r| r.base_rtl)
+    }
+
+    /// The offset one step to the visual left/right of the caret, taking the
+    /// row's direction into account.
+    fn horizontal_step(&self, visual_right: bool) -> usize {
+        let off = self.cursor_offset();
+        let (row, col) = self.row_col(off);
+        // Inside a bidi row, "one step right" is not "one byte forward, maybe
+        // flipped". A Latin word or URL embedded in Persian runs the other way,
+        // and the caret has to flow THROUGH it rather than jump to its far end
+        // — so the step comes from the glyph order, via the row's map.
+        if let Some(r) = self.bidi_map(row) {
+            let dcol = self.display_col(row, col);
+            let (k, local) = r.row_of(dcol);
+            if let Some(rr) = r.rows.get(k)
+                && let Some(next) = rr.map.step_visual(local, visual_right)
+            {
+                let target = self.line_starts()[row] + self.source_col(row, rr.start + next);
+                // A visual step that doesn't move the caret in the DOCUMENT has
+                // landed inside something atomic — an inline formula's spacer,
+                // whose every display byte maps back to the span's start. The
+                // logical stepper knows how to cross those (and how to hand the
+                // formula to its editor), so defer to it rather than sitting
+                // still.
+                if target != off {
+                    // Landing ON a spacer resolves to the span's START, and the
+                    // "is the caret inside a formula?" test wants strictly
+                    // inside — so approaching a formula from its end side, the
+                    // caret stepped to the start, failed the test, and the next
+                    // press left the formula behind. Step one byte in so the
+                    // formula opens from either side.
+                    let line_start = self.line_starts()[row];
+                    let here = off.saturating_sub(line_start);
+                    let lands_on_a_formula = markdown_syntax::inline_math_spans(self.line_str(row))
+                        .into_iter()
+                        .any(|s| {
+                            line_start + s.start == target && !(s.start < here && here < s.end)
+                        });
+                    return if lands_on_a_formula {
+                        target + 1
+                    } else {
+                        target
+                    };
+                }
+            }
+            // Off the end of this row: fall through to the logical neighbour,
+            // which is what carries the caret onto the next row or line.
+            return if visual_right != self.caret_row_is_rtl() {
+                self.next_visible_boundary(off)
+            } else {
+                self.prev_visible_boundary(off)
+            };
+        }
+        if visual_right {
+            self.next_visible_boundary(off)
+        } else {
+            let target = self.prev_visible_boundary(off);
+            // Same nudge as the bidi branch above: a leftward step over a formula's
+            // spacer resolves to the span's START, which fails `left()`'s strictly-
+            // inside test — so on plain LTR rows the editor never opened from the
+            // right and the caret just seated at the formula's start (#77).
+            let (trow, _) = self.row_col(target);
+            let line_start = self.line_starts()[trow];
+            let here = off.saturating_sub(line_start);
+            let lands_on_a_formula = markdown_syntax::inline_math_spans(self.line_str(trow))
+                .into_iter()
+                .any(|s| line_start + s.start == target && !(s.start < here && here < s.end));
+            if lands_on_a_formula {
+                target + 1
+            } else {
+                target
+            }
+        }
+    }
+
+    /// The RTL layout for `row`, if it has one (see [`RtlRow`]).
+    fn bidi_map(&self, row: usize) -> Option<&RtlRow> {
+        self.rtl_rows.get(row).and_then(Option::as_ref)
+    }
+
     /// Window-space bounds of the caret at `offset`, from the last paint's
     /// layout — for anchoring a popup (e.g. a slash menu) at a document offset.
     /// `None` before the first paint or if `offset`'s row isn't laid out.
@@ -1617,9 +1867,9 @@ impl EditorState {
         let (row, col) = self.row_col(offset);
         let lh = self.line_h(row);
         let line = self.wrapped.get(row)?;
-        let p = line.position_for_index(self.display_col(row, col), lh)?;
+        let p = line_pos(line, self.bidi_map(row), self.display_col(row, col), lh)?;
         let top = bounds.top() + self.line_tops.get(row).copied().unwrap_or(px(0.)) + p.y;
-        let x = bounds.left() + p.x + self.line_inset(row);
+        let x = bounds.left() + p.x + self.row_origin_x(row);
         Some(Bounds::from_corners(point(x, top), point(x, top + lh)))
     }
 
@@ -1661,16 +1911,24 @@ impl EditorState {
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            self.move_to(self.selected_range.start, cx);
+            // Collapse to the selection's VISUALLY left edge, which on an RTL
+            // row is its logical end.
+            let to = if self.caret_row_is_rtl() {
+                self.selected_range.end
+            } else {
+                self.selected_range.start
+            };
+            self.move_to(to, cx);
             return;
         }
         if self.caret_in_table()
-            && let Some(off) = self.table_move_horizontal(-1)
+            && let Some(off) =
+                self.table_move_horizontal(if self.caret_table_is_rtl() { 1 } else { -1 })
         {
             self.move_to(off, cx);
             return;
         }
-        let off = self.prev_visible_boundary(self.cursor_offset());
+        let off = self.horizontal_step(false);
         if let Some((range, source)) = self.inline_math_span_at(off) {
             cx.emit(EditorEvent::EditMath {
                 range,
@@ -1704,16 +1962,22 @@ impl EditorState {
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            self.move_to(self.selected_range.end, cx);
+            let to = if self.caret_row_is_rtl() {
+                self.selected_range.start
+            } else {
+                self.selected_range.end
+            };
+            self.move_to(to, cx);
             return;
         }
         if self.caret_in_table()
-            && let Some(off) = self.table_move_horizontal(1)
+            && let Some(off) =
+                self.table_move_horizontal(if self.caret_table_is_rtl() { -1 } else { 1 })
         {
             self.move_to(off, cx);
             return;
         }
-        let off = self.next_visible_boundary(self.cursor_offset());
+        let off = self.horizontal_step(true);
         if let Some((range, source)) = self.inline_math_span_at(off) {
             cx.emit(EditorEvent::EditMath {
                 range,
@@ -1835,12 +2099,14 @@ impl EditorState {
 
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
-        self.select_to(self.prev_visible_boundary(self.cursor_offset()), cx);
+        let off = self.horizontal_step(false);
+        self.select_to(off, cx);
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
-        self.select_to(self.next_visible_boundary(self.cursor_offset()), cx);
+        let off = self.horizontal_step(true);
+        self.select_to(off, cx);
     }
 
     fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -2487,10 +2753,24 @@ impl EditorState {
         // report no math block here — clicks / arrows / `/math` stay in the text editor.
         self.markdown_style.as_ref()?;
         let starts = self.line_starts();
-        markdown_syntax::math_blocks(&self.content)
-            .into_iter()
+        let blocks = markdown_syntax::math_blocks(&self.content);
+        blocks
+            .iter()
             .find(|(r, _)| r.contains(&row))
-            .map(|(r, source)| (starts[r.start]..self.line_end(r.end - 1), source.into()))
+            .or_else(|| {
+                // A `<!-- math:ALIGN -->` marker row belongs to the block directly
+                // below it: it's invisible in WYSIWYG, so a caret seated there —
+                // e.g. arrow-up returns offset 0 when the block opens the document
+                // (#77) — would reveal the raw rows instead of opening the editor.
+                markdown_syntax::math_align_marker(self.line_str(row))?;
+                blocks.iter().find(|(r, _)| r.start == row + 1)
+            })
+            .map(|(r, source)| {
+                (
+                    starts[r.start]..self.line_end(r.end - 1),
+                    source.clone().into(),
+                )
+            })
     }
 
     /// A `$$` block's byte range grown for deletion: takes in the
@@ -3832,11 +4112,13 @@ impl EditorState {
             }
         } else {
             let (start_row, _) = self.row_col(block.start);
-            if start_row > 0 {
-                self.line_end(start_row - 1)
-            } else {
-                0
+            // An alignment marker directly above belongs to the block — resting
+            // on it reveals the region, so step past it too.
+            let mut row = start_row;
+            if row > 0 && markdown_syntax::math_align_marker(self.line_str(row - 1)).is_some() {
+                row -= 1;
             }
+            if row > 0 { self.line_end(row - 1) } else { 0 }
         };
         self.move_to(target, cx);
     }
@@ -3951,12 +4233,15 @@ impl EditorState {
         let Some(cur) = self
             .wrapped
             .get(row)
-            .and_then(|l| l.position_for_index(self.display_col(row, col), cur_lh))
+            .and_then(|l| line_pos(l, self.bidi_map(row), self.display_col(row, col), cur_lh))
         else {
             return self.vertical_offset(dir);
         };
         let global_y = self.line_tops[row] + cur.y;
-        let goal = self.goal_x.unwrap_or(cur.x);
+        // The goal column is the caret's *visual* x, so it carries an RTL row's
+        // right-align shift — the target row's shift comes off again below.
+        // (Row insets stay out of it, as they always have.)
+        let goal = self.goal_x.unwrap_or(cur.x + self.rtl_shift(row));
         self.goal_x = Some(goal);
         // Step to the adjacent visual row. Down: to the bottom of the current
         // row (= the top of the next one). Up: just above the current row's top
@@ -4043,10 +4328,16 @@ impl EditorState {
                 }
             }
         }
-        let rel = point(goal, (target_y - self.line_tops[trow]).max(px(0.)));
-        let col = match self.wrapped[trow].closest_index_for_position(rel, self.line_h(trow)) {
-            Ok(i) | Err(i) => i,
-        };
+        let rel = point(
+            (goal - self.rtl_shift(trow)).max(px(0.)),
+            (target_y - self.line_tops[trow]).max(px(0.)),
+        );
+        let col = line_index_at(
+            &self.wrapped[trow],
+            self.bidi_map(trow),
+            rel,
+            self.line_h(trow),
+        );
         self.line_starts()[trow] + self.source_col(trow, col)
     }
 
@@ -4304,11 +4595,14 @@ impl EditorState {
         if self.widget_rows.get(row).copied().unwrap_or(false) {
             return self.line_starts()[row];
         }
-        let x = (rel.x - self.line_inset(row)).max(px(0.));
+        let x = (rel.x - self.row_origin_x(row)).max(px(0.));
         let line_rel = point(x, rel.y - self.line_tops[row]);
-        let col = match self.wrapped[row].closest_index_for_position(line_rel, self.line_h(row)) {
-            Ok(i) | Err(i) => i,
-        };
+        let col = line_index_at(
+            &self.wrapped[row],
+            self.bidi_map(row),
+            line_rel,
+            self.line_h(row),
+        );
         self.line_starts()[row] + self.source_col(row, col)
     }
 
@@ -4615,18 +4909,19 @@ impl EntityInputHandler for EditorState {
         let (row, col) = self.row_col(range.start);
         let lh = self.line_h(row);
         let line = self.wrapped.get(row)?;
-        let p = line.position_for_index(self.display_col(row, col), lh)?;
+        let map = self.bidi_map(row);
+        let p = line_pos(line, map, self.display_col(row, col), lh)?;
         let top = bounds.top() + self.line_tops.get(row).copied().unwrap_or(px(0.)) + p.y;
-        let x = bounds.left() + p.x + self.line_inset(row);
+        let x = bounds.left() + p.x + self.row_origin_x(row);
         // Span the whole range when it stays on one wrap row (the common IME
         // composition), so the candidate window anchors under the marked TEXT
         // rather than a zero-width bar at its start. Multi-row ranges keep the
         // start-anchored bar.
         let (erow, ecol) = self.row_col(range.end);
         let x2 = if erow == row && range.end > range.start {
-            line.position_for_index(self.display_col(row, ecol), lh)
+            line_pos(line, map, self.display_col(row, ecol), lh)
                 .filter(|e| e.y == p.y)
-                .map(|e| bounds.left() + e.x + self.line_inset(row))
+                .map(|e| bounds.left() + e.x + self.row_origin_x(row))
                 .unwrap_or(x)
         } else {
             x
@@ -4801,7 +5096,7 @@ impl Render for EditorState {
                 // Cut / Copy need a selection; Paste always applies (the caret
                 // was seated at the click when it landed outside the selection).
                 let has_sel = !self.selected_range.is_empty();
-                let clip_item = |id: &'static str, label: &'static str| {
+                let clip_item = |id: &'static str, label: SharedString| {
                     div()
                         .id(id)
                         .flex_shrink_0()
@@ -4813,42 +5108,51 @@ impl Render for EditorState {
                 let mut clipboard = div().flex().flex_col().py(px(4.));
                 if has_sel {
                     clipboard = clipboard
-                        .child(clip_item("menu-cut", "Cut").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.menu = None;
-                                editor.cut(&Cut, window, cx);
-                            }),
-                        ))
-                        .child(clip_item("menu-copy", "Copy").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.menu = None;
-                                editor.copy(&Copy, window, cx);
-                            }),
-                        ))
+                        .child(
+                            clip_item("menu-cut", self.labels.cut.clone()).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.menu = None;
+                                    editor.cut(&Cut, window, cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            clip_item("menu-copy", self.labels.copy.clone()).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                    cx.stop_propagation();
+                                    editor.menu = None;
+                                    editor.copy(&Copy, window, cx);
+                                }),
+                            ),
+                        )
                         // Plain-only: the raw markdown with no host flavors —
                         // for pasting literal source into rich surfaces
                         // (email, chat) where Copy's HTML flavor would win.
-                        .child(clip_item("menu-copy-md", "Copy as Markdown").on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                                cx.stop_propagation();
-                                editor.menu = None;
-                                editor.copy_plain(window, cx);
-                            }),
-                        ));
+                        .child(
+                            clip_item("menu-copy-md", self.labels.copy_as_markdown.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        editor.menu = None;
+                                        editor.copy_plain(window, cx);
+                                    }),
+                                ),
+                        );
                 }
-                let clipboard = clipboard.child(clip_item("menu-paste", "Paste").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|editor, _: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        editor.menu = None;
-                        editor.paste(&Paste, window, cx);
-                    }),
-                ));
+                let clipboard = clipboard.child(
+                    clip_item("menu-paste", self.labels.paste.clone()).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|editor, _: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            editor.menu = None;
+                            editor.paste(&Paste, window, cx);
+                        }),
+                    ),
+                );
 
                 // Inline-format bar (Cditor-style): with a selection, a strip of
                 // B / I / S / <> buttons across the menu's top — each toggles its
@@ -4960,7 +5264,7 @@ impl Render for EditorState {
                     .items_center()
                     .justify_between()
                     .gap(px(16.))
-                    .child("Turn into")
+                    .child(self.labels.turn_into.clone())
                     .child(div().text_size(px(10.)).child("\u{25b8}"))
                     .on_hover(cx.listener(|editor, hovered: &bool, _, cx| {
                         if *hovered
@@ -4971,6 +5275,7 @@ impl Render for EditorState {
                             cx.notify();
                         }
                     }));
+                let turn_labels = self.labels.clone();
                 let turn_flyout = menu_turn_into.then(|| {
                     let rows: Vec<_> = TurnKind::ALL
                         .iter()
@@ -4992,7 +5297,7 @@ impl Render for EditorState {
                                 } else {
                                     ""
                                 }))
-                                .child(k.label())
+                                .child(k.label(&turn_labels))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |editor, _: &MouseDownEvent, window, cx| {
@@ -5109,7 +5414,7 @@ impl Render for EditorState {
                     Div,
                     Item {
                         glyph: &'static str,
-                        label: &'static str,
+                        label: SharedString,
                         action: TableMenuAction,
                         red: bool,
                         checked: bool,
@@ -5123,30 +5428,50 @@ impl Render for EditorState {
                     checked: false,
                 };
                 let specs = [
-                    item("↑", "Insert row above", TableMenuAction::InsertRowAbove),
-                    item("↓", "Insert row below", TableMenuAction::InsertRowBelow),
-                    item("⧉", "Duplicate row", TableMenuAction::DuplicateRow),
+                    item(
+                        "↑",
+                        self.labels.insert_row_above.clone(),
+                        TableMenuAction::InsertRowAbove,
+                    ),
+                    item(
+                        "↓",
+                        self.labels.insert_row_below.clone(),
+                        TableMenuAction::InsertRowBelow,
+                    ),
+                    item(
+                        "⧉",
+                        self.labels.duplicate_row.clone(),
+                        TableMenuAction::DuplicateRow,
+                    ),
                     Row::Div,
-                    item("←", "Insert column left", TableMenuAction::InsertColLeft),
-                    item("→", "Insert column right", TableMenuAction::InsertColRight),
+                    item(
+                        "←",
+                        self.labels.insert_column_left.clone(),
+                        TableMenuAction::InsertColLeft,
+                    ),
+                    item(
+                        "→",
+                        self.labels.insert_column_right.clone(),
+                        TableMenuAction::InsertColRight,
+                    ),
                     Row::Div,
                     Row::Item {
                         glyph: "",
-                        label: "Align left",
+                        label: self.labels.align_left.clone(),
                         action: TableMenuAction::AlignLeft,
                         red: false,
                         checked: cur_align == Some(CellAlign::Left),
                     },
                     Row::Item {
                         glyph: "",
-                        label: "Align center",
+                        label: self.labels.align_center.clone(),
                         action: TableMenuAction::AlignCenter,
                         red: false,
                         checked: cur_align == Some(CellAlign::Center),
                     },
                     Row::Item {
                         glyph: "",
-                        label: "Align right",
+                        label: self.labels.align_right.clone(),
                         action: TableMenuAction::AlignRight,
                         red: false,
                         checked: cur_align == Some(CellAlign::Right),
@@ -5154,52 +5479,56 @@ impl Render for EditorState {
                     Row::Div,
                     Row::Item {
                         glyph: "▦",
-                        label: "Grid style",
+                        label: self.labels.grid_style.clone(),
                         action: TableMenuAction::SetStyle(None),
                         red: false,
                         checked: cur_style == TS::Grid,
                     },
                     Row::Item {
                         glyph: "▤",
-                        label: "Striped style",
+                        label: self.labels.striped_style.clone(),
                         action: TableMenuAction::SetStyle(Some("striped")),
                         red: false,
                         checked: cur_style == TS::Striped,
                     },
                     Row::Item {
                         glyph: "▥",
-                        label: "Header style",
+                        label: self.labels.header_style.clone(),
                         action: TableMenuAction::SetStyle(Some("header")),
                         red: false,
                         checked: cur_style == TS::Header,
                     },
                     Row::Item {
                         glyph: "─",
-                        label: "Minimal style",
+                        label: self.labels.minimal_style.clone(),
                         action: TableMenuAction::SetStyle(Some("minimal")),
                         red: false,
                         checked: cur_style == TS::Minimal,
                     },
                     Row::Div,
-                    item("⊞", "Copy as Markdown", TableMenuAction::CopyTable),
+                    item(
+                        "⊞",
+                        self.labels.copy_as_markdown.clone(),
+                        TableMenuAction::CopyTable,
+                    ),
                     Row::Div,
                     Row::Item {
                         glyph: "✕",
-                        label: "Delete row",
+                        label: self.labels.delete_row.clone(),
                         action: TableMenuAction::DeleteRow,
                         red: true,
                         checked: false,
                     },
                     Row::Item {
                         glyph: "✕",
-                        label: "Delete column",
+                        label: self.labels.delete_column.clone(),
                         action: TableMenuAction::DeleteColumn,
                         red: true,
                         checked: false,
                     },
                     Row::Item {
                         glyph: "✕",
-                        label: "Delete table",
+                        label: self.labels.delete_table.clone(),
                         action: TableMenuAction::DeleteTable,
                         red: true,
                         checked: false,
@@ -5251,7 +5580,7 @@ impl Render for EditorState {
                                             .text_color(glyph_c)
                                             .child(glyph),
                                     )
-                                    .child(div().flex_1().child(SharedString::from(label)))
+                                    .child(div().flex_1().child(label))
                                     .children(checked.then(|| div().text_color(glyph_c).child("✓")))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -5329,7 +5658,7 @@ impl Render for EditorState {
                 let menu_border = st.map_or(rgb(0x45454c).into(), |s| s.popover_border);
                 let menu_fg = st.map_or(rgb(0xe6e6e6).into(), |s| s.popover_fg);
                 let hover = st.map_or(rgba(0x2f6fd628).into(), |s| s.popover_hover);
-                let item = |id: &'static str, label: &'static str| {
+                let item = |id: &'static str, label: SharedString| {
                     div()
                         .id(id)
                         .px(px(10.))
@@ -5356,30 +5685,38 @@ impl Render for EditorState {
                                 editor.prop_menu = None;
                                 cx.notify();
                             }))
-                            .child(item("prop-menu-edit", "Edit properties").on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    editor.prop_menu = None;
-                                    if let Some((range, source)) = editor.property_block_at(row) {
-                                        let block_row = row - editor.row_col(range.start).0;
-                                        cx.emit(EditorEvent::EditProperties {
-                                            range,
-                                            source,
-                                            at_end: false,
-                                            row: Some(block_row),
-                                        });
-                                    }
-                                }),
-                            ))
-                            .child(item("prop-menu-delete", "Delete property").on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    editor.prop_menu = None;
-                                    editor.delete_property_row(row, cx);
-                                }),
-                            )),
+                            .child(
+                                item("prop-menu-edit", self.labels.edit_properties.clone())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.prop_menu = None;
+                                            if let Some((range, source)) =
+                                                editor.property_block_at(row)
+                                            {
+                                                let block_row = row - editor.row_col(range.start).0;
+                                                cx.emit(EditorEvent::EditProperties {
+                                                    range,
+                                                    source,
+                                                    at_end: false,
+                                                    row: Some(block_row),
+                                                });
+                                            }
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                item("prop-menu-delete", self.labels.delete_property.clone())
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            editor.prop_menu = None;
+                                            editor.delete_property_row(row, cx);
+                                        }),
+                                    ),
+                            ),
                     ),
                 )
             }))
@@ -5414,7 +5751,7 @@ impl Render for EditorState {
                                     .px(px(10.))
                                     .py(px(3.))
                                     .hover(move |s| s.bg(hover))
-                                    .child("Delete image")
+                                    .child(self.labels.delete_image.clone())
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |editor, _: &MouseDownEvent, _, cx| {
@@ -5585,6 +5922,10 @@ struct BlockImg {
 #[derive(Clone)]
 struct InlineMath {
     display_off: usize,
+    /// Byte length of the spacer this raster sits over. On an RTL row
+    /// `display_off` is its RIGHT edge, so the whole span is needed to find the
+    /// left one — see where it is painted.
+    len: usize,
     /// ABSOLUTE byte range of the `$…$` span in the document — to hit-test a click on the
     /// formula back to its edit range and to position the seated editor.
     source: Range<usize>,
@@ -5684,6 +6025,7 @@ struct CodeChipHit {
 /// draws at these bounds and the hitboxes flip the cursor.
 struct CodeChip {
     lang_text: SharedString,
+    copy_text: SharedString,
     lang_bounds: Bounds<Pixels>,
     copy_bounds: Bounds<Pixels>,
     fence_row: usize,
@@ -5727,6 +6069,9 @@ struct TableRow {
     border: Hsla,
     /// Row-shade color for striped / header-shaded styles (a faint tint).
     shade: Hsla,
+    /// The table reads right-to-left (#66) — from its region's
+    /// [`markdown_syntax::TableRegion::rtl`], so every row of one table agrees.
+    rtl: bool,
 }
 
 /// A per-line "gutter" decoration: a left-margin treatment that hides its source
@@ -5822,8 +6167,14 @@ struct ShapedDoc {
     inline_maths: Vec<Vec<InlineMath>>,
     /// Per-line wrap-row count. Geometry (line tops, total height) reads THIS,
     /// not `wrap_boundaries()` — a windowed-out line's `WrappedLine` is an
-    /// empty placeholder, but its cached count keeps the layout exact.
+    /// empty placeholder, but its cached count keeps the layout exact. For an
+    /// RTL line it is OUR row count, which is not gpui's (#66).
     wrap_rows: Vec<usize>,
+    /// Per-line bidi layout: whether the line READS right-to-left, plus the
+    /// rows we broke in logical order. `None` for lines with no RTL at all,
+    /// which keep gpui's own wrapping. Drives that line's paint, caret,
+    /// selection and hit-testing.
+    rtl_rows: Vec<Option<(bool, Vec<gpui_bidi::paragraph::Row>)>>,
 }
 
 impl ShapedDoc {
@@ -5860,6 +6211,7 @@ impl ShapedDoc {
         self.marks.push(mark);
         self.inline_maths.push(Vec::new());
         self.wrap_rows.push(rows);
+        self.rtl_rows.push(None);
     }
 }
 
@@ -5896,6 +6248,157 @@ fn display_col_in(map: Option<&std::rc::Rc<Vec<usize>>>, source_col: usize) -> u
         // just before the formula must land at the spacer's LEFT edge, not somewhere inside it.
         Some(m) => m.partition_point(|&s| s < source_col),
         None => source_col,
+    }
+}
+
+/// The painted position of display column `dcol` on a shaped line: gpui's own
+/// lookup, with the x taken from the row's bidi map when it has one (#66).
+///
+/// gpui's `x_for_index` returns the first glyph whose `index >= dcol`, and the
+/// first glyph of an RTL line carries the HIGHEST index — so every offset in
+/// the line collapses onto x = 0. The y (which wrap row) stays gpui's; a row
+/// only gets a map while it is ONE visual row, so it is always 0 there.
+/// Excludes the row's insets — callers add [`EditorState::row_origin_x`].
+fn line_pos(
+    line: &WrappedLine,
+    rtl: Option<&RtlRow>,
+    dcol: usize,
+    lh: Pixels,
+) -> Option<Point<Pixels>> {
+    match rtl {
+        // Our own rows: which one holds the offset decides the y, and the
+        // row's map the x. gpui's layout is not consulted at all — its rows
+        // are not ours.
+        Some(r) => {
+            let (row, local) = r.row_of(dcol);
+            let x = px(r.rows.get(row)?.map.x_for_index(local)) + r.shift_delta(row);
+            Some(point(x, lh * row))
+        }
+        None => line.position_for_index(dcol, lh),
+    }
+}
+
+/// The display column a click at row-local `p` names — the inverse of
+/// [`line_pos`], through the bidi map when the row has one (gpui's
+/// `closest_index_for_x` fails on RTL the same way `x_for_index` does).
+fn line_index_at(line: &WrappedLine, rtl: Option<&RtlRow>, p: Point<Pixels>, lh: Pixels) -> usize {
+    match rtl {
+        Some(r) if !r.rows.is_empty() => {
+            let row = ((f32::from(p.y) / f32::from(lh).max(1.0)).floor().max(0.) as usize)
+                .min(r.rows.len() - 1);
+            let x = p.x - r.shift_delta(row);
+            let Some(rr) = r.rows.get(row) else {
+                return 0;
+            };
+            rr.start + rr.map.index_for_x(f32::from(x))
+        }
+        _ => match line.closest_index_for_position(p, lh) {
+            Ok(i) | Err(i) => i,
+        },
+    }
+}
+
+/// A right-to-left row's editor-side geometry, built in prepaint (#66).
+///
+/// Only rows whose source reads RTL ([`gpui_markdown::syntax::base_direction`])
+/// get one — the flag *is* `Option::is_some`, so an LTR document allocates
+/// nothing and keeps taking gpui's own (cheaper) lookups.
+pub(crate) struct RtlRow {
+    /// The line's visual rows, broken in LOGICAL order (gpui's own wrapping
+    /// slices the reordered glyph run and gets them backwards). Each carries
+    /// the map that turns an offset inside it into an x and back.
+    rows: Vec<gpui_bidi::paragraph::Row>,
+    /// Each row's right-align shift, parallel to `rows`: added to the text
+    /// origin so the row right-aligns in the content width (see [`rtl_shift`]).
+    /// Per ROW, not per line — a short last row shifts further than a full one.
+    /// Kept OUT of `line_insets` on purpose: the list-marker + gutter math
+    /// reads that, and must not move with the text.
+    shifts: Vec<Pixels>,
+    /// Does the line READ right-to-left? A left-to-right line containing a
+    /// Persian phrase gets rows and maps too, but stays left-aligned and keeps
+    /// left-to-right arrow keys.
+    base_rtl: bool,
+}
+
+impl RtlRow {
+    /// The row holding display column `dcol`, and the column's offset within
+    /// it. Rows are in reading order and contiguous, so the last row wins for
+    /// an offset at the very end of the line.
+    fn row_of(&self, dcol: usize) -> (usize, usize) {
+        row_of_spans(self.rows.iter().map(|r| (r.start, r.len)), dcol)
+    }
+
+    /// A row's horizontal extent (left, right) relative to the FIRST row's
+    /// origin — the coordinate space callers already work in, since they add
+    /// `row_origin_x`. Used to band a selection across a row: an RTL row does
+    /// not span the content width, so "the whole row" is this, not 0..width.
+    pub(crate) fn row_extent(&self, row: usize) -> (Pixels, Pixels) {
+        let d = self.shift_delta(row);
+        (d, d + self.rows.get(row).map_or(px(0.), |r| r.width))
+    }
+
+    /// How many visual rows this line broke into.
+    pub(crate) fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// A row's shift relative to the FIRST row's. Callers already add
+    /// `row_origin_x`, which carries row 0's shift, so this is the remainder —
+    /// that keeps every existing caller correct without threading a wrap-row
+    /// index through all of them.
+    fn shift_delta(&self, row: usize) -> Pixels {
+        self.shifts.get(row).copied().unwrap_or(px(0.))
+            - self.shifts.first().copied().unwrap_or(px(0.))
+    }
+}
+
+/// Which row holds display column `dcol`, and its offset within that row.
+///
+/// Split out from [`RtlRow::row_of`] so it can be tested without a window: a
+/// `Row` carries a shaped line, which needs one. Rows are contiguous and in
+/// reading order, so an offset at the very end of the line lands on the last
+/// row rather than falling off the end — that is where the caret sits after
+/// typing at the end of a paragraph.
+fn row_of_spans(rows: impl Iterator<Item = (usize, usize)>, dcol: usize) -> (usize, usize) {
+    let mut last = (0, dcol);
+    let mut seen = false;
+    for (i, (start, len)) in rows.enumerate() {
+        seen = true;
+        last = (i, dcol.saturating_sub(start));
+        if dcol < start + len {
+            return (i, dcol - start);
+        }
+    }
+    if seen { last } else { (0, dcol) }
+}
+
+/// The x a right-to-left row's text starts at within `content_width`, so its
+/// *trailing* edge sits `inset` in from the right — the mirror of the leading
+/// `inset` an LTR row gets. Zero once the text no longer fits (it wraps, and
+/// every wrap row starts at the left edge).
+///
+/// Callers add this to the origin they already inset, hence the doubled
+/// `inset`: `origin + inset + shift` lands the text `inset` from the right.
+fn rtl_shift(content_width: Pixels, inset: Pixels, line_width: Pixels) -> Pixels {
+    (content_width - inset * 2. - line_width).max(px(0.))
+}
+
+/// Mirror a gutter marker's x (a bullet, a number, a checkbox) to the right
+/// edge for an RTL row, so it sits on the side the text now starts at —
+/// matching the reader's `flex_row_reverse` list items. Nesting is preserved:
+/// a deeper level's larger `marker_x` indents further from the right.
+fn rtl_marker_x(content_width: Pixels, marker_x: Pixels, marker_width: Pixels) -> Pixels {
+    (content_width - marker_x - marker_width).max(px(0.))
+}
+
+/// A task row's checkbox x within the content width, mirrored on an RTL row.
+/// One function so the prepaint hitbox (the hand cursor) and the paint (the
+/// box, and the rects a click hit-tests) can never land on different sides.
+fn checkbox_x(bullet_x: Pixels, size: Pixels, content_width: Pixels, rtl: bool) -> Pixels {
+    if rtl {
+        rtl_marker_x(content_width, bullet_x, size)
+    } else {
+        bullet_x
     }
 }
 
@@ -6217,5 +6720,171 @@ mod tests {
         );
         // Not an image row: returned unchanged.
         assert_eq!(set_image_width("just text", 100), "just text");
+    }
+
+    // --- RTL row geometry (#66) ---------------------------------------------
+
+    use super::{checkbox_x, px, row_of_spans, rtl_marker_x, rtl_shift};
+
+    #[test]
+    fn a_caret_offset_lands_on_the_row_that_holds_it() {
+        // Three rows: "0..5", "5..11", "11..14" — contiguous, reading order.
+        let rows = || [(0usize, 5usize), (5, 6), (11, 3)].into_iter();
+        assert_eq!(row_of_spans(rows(), 0), (0, 0));
+        assert_eq!(row_of_spans(rows(), 4), (0, 4));
+        // A boundary belongs to the row that STARTS there, not the one ending.
+        assert_eq!(row_of_spans(rows(), 5), (1, 0));
+        assert_eq!(row_of_spans(rows(), 12), (2, 1));
+        // The caret sits one past the last character after typing at the end
+        // of a paragraph: it must stay on the last row, not fall off.
+        assert_eq!(row_of_spans(rows(), 14), (2, 3));
+        assert_eq!(row_of_spans(rows(), 99), (2, 88));
+        // No rows at all (an empty line) is row 0.
+        assert_eq!(row_of_spans([].into_iter(), 0), (0, 0));
+    }
+
+    #[test]
+    fn rtl_shift_mirrors_the_row_inset() {
+        // Plain paragraph (no inset): the text's right edge meets the content
+        // edge, so the shift is all the slack.
+        assert_eq!(rtl_shift(px(500.), px(0.), px(200.)), px(300.));
+        // Inset row (a list item / blockquote body): callers add the shift to
+        // an origin they already inset, so the doubled inset leaves the SAME
+        // gap on the right that an LTR row gets on the left.
+        assert_eq!(rtl_shift(px(500.), px(24.), px(200.)), px(252.));
+        assert_eq!(px(24.) + rtl_shift(px(500.), px(24.), px(200.)), px(276.));
+        // …i.e. text spans 276..476, exactly 24 in from the right edge.
+        // Text that fills or overflows the row wraps, and every wrap row starts
+        // at the left edge — no shift, never a negative one.
+        assert_eq!(rtl_shift(px(500.), px(0.), px(500.)), px(0.));
+        assert_eq!(rtl_shift(px(500.), px(0.), px(900.)), px(0.));
+        assert_eq!(rtl_shift(px(100.), px(60.), px(50.)), px(0.));
+    }
+
+    #[test]
+    fn rtl_markers_mirror_to_the_right_edge() {
+        // A bullet 8px wide at x=10 lands 10 in from the right edge instead.
+        assert_eq!(rtl_marker_x(px(500.), px(10.), px(8.)), px(482.));
+        // Nesting is preserved: a deeper level (larger x) indents further FROM
+        // THE RIGHT, so the levels keep their order.
+        let l1 = rtl_marker_x(px(500.), px(10.), px(8.));
+        let l2 = rtl_marker_x(px(500.), px(34.), px(8.));
+        assert!(l2 < l1, "level 2 must sit further in from the right");
+        assert_eq!(l1 - l2, px(24.), "the indent step survives the mirror");
+        // Never off the left edge, however wide the marker.
+        assert_eq!(rtl_marker_x(px(20.), px(10.), px(40.)), px(0.));
+        // The checkbox shares that math, and an LTR row is untouched.
+        assert_eq!(checkbox_x(px(10.), px(12.), px(500.), true), px(478.));
+        assert_eq!(checkbox_x(px(10.), px(12.), px(500.), false), px(10.));
+    }
+
+    // --- RTL table placement (#66) ------------------------------------------
+
+    use super::tables::{TABLE_GUTTER, table_left_x, table_visible_band};
+
+    /// The note column used throughout: origin 100, width 500 → the LTR band
+    /// is 122..600 and the RTL band 100..578, both `TABLE_GUTTER` wide.
+    const O: f32 = 100.;
+    const W: f32 = 500.;
+
+    #[test]
+    fn an_rtl_table_hugs_the_right_edge_with_the_gutter_mirrored() {
+        let g = TABLE_GUTTER;
+        // A table narrower than the column: LTR starts a gutter in from the
+        // left, RTL *ends* a gutter in from the right.
+        let ltr = table_left_x(px(O), px(W), px(300.), px(0.), false);
+        let rtl = table_left_x(px(O), px(W), px(300.), px(0.), true);
+        assert_eq!(ltr, px(O + g));
+        assert_eq!(rtl + px(300.), px(O + W - g), "right edge, one gutter in");
+        // The two are mirror images about the column's centre.
+        assert_eq!(
+            f32::from(ltr - px(O)),
+            f32::from(px(O + W) - (rtl + px(300.)))
+        );
+        // Column widths don't move an LTR table but do move an RTL one — it is
+        // anchored at its trailing edge.
+        assert_eq!(
+            table_left_x(px(O), px(W), px(120.), px(0.), false),
+            px(O + g)
+        );
+        assert_eq!(
+            table_left_x(px(O), px(W), px(120.), px(0.), true),
+            px(O + W - g - 120.)
+        );
+    }
+
+    #[test]
+    fn a_wide_table_scrolls_to_its_own_far_edge_either_way() {
+        let g = TABLE_GUTTER;
+        let total = px(900.);
+        let avail = px(W - g); // what `table_sx` clamps against
+        let max = total - avail;
+        // Unscrolled, each direction shows its own leading edge at the gutter.
+        assert_eq!(table_left_x(px(O), px(W), total, px(0.), false), px(O + g));
+        assert_eq!(
+            table_left_x(px(O), px(W), total, px(0.), true) + total,
+            px(O + W - g)
+        );
+        // Fully scrolled, each shows its trailing edge at the band's far side:
+        // LTR's right edge reaches the column's right, RTL's left edge the left.
+        assert_eq!(
+            table_left_x(px(O), px(W), total, max, false) + total,
+            px(O + W)
+        );
+        assert_eq!(table_left_x(px(O), px(W), total, max, true), px(O));
+        // Scroll moves the content in OPPOSITE directions — why the wheel and
+        // the thumb's `factor` invert their sign on an RTL table.
+        let step = px(50.);
+        assert!(table_left_x(px(O), px(W), total, step, false) < px(O + g));
+        assert!(
+            table_left_x(px(O), px(W), total, step, true)
+                > table_left_x(px(O), px(W), total, px(0.), true)
+        );
+    }
+
+    #[test]
+    fn rtl_mirrors_the_column_order() {
+        use super::tables::{cell_span_width, col_offset};
+        // Three columns, 10/20/30 wide. Left to right they start at 0/10/30;
+        // mirrored, column 0 is the RIGHTMOST, so it starts at 50.
+        let w = [px(10.), px(20.), px(30.)];
+        assert_eq!(col_offset(&w, 3, 0, false), px(0.));
+        assert_eq!(col_offset(&w, 3, 1, false), px(10.));
+        assert_eq!(col_offset(&w, 3, 2, false), px(30.));
+        assert_eq!(col_offset(&w, 3, 0, true), px(50.));
+        assert_eq!(col_offset(&w, 3, 1, true), px(30.));
+        assert_eq!(col_offset(&w, 3, 2, true), px(0.));
+        // Either way the columns tile the table with no gap or overlap — paint,
+        // caret and hit-testing all read this, so a gap is a mis-click.
+        for rtl in [false, true] {
+            let mut spans: Vec<(f32, f32)> = (0..3)
+                .map(|c| {
+                    let x = f32::from(col_offset(&w, 3, c, rtl));
+                    (x, x + f32::from(cell_span_width(&w, 3, c)))
+                })
+                .collect();
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(spans[0].0, 0.0);
+            assert_eq!(spans[2].1, 60.0);
+            assert!(spans.windows(2).all(|s| s[0].1 == s[1].0), "{spans:?}");
+        }
+    }
+
+    #[test]
+    fn the_visible_band_is_the_column_less_its_gutter() {
+        let g = TABLE_GUTTER;
+        assert_eq!(
+            table_visible_band(px(O), px(W), false),
+            (px(O + g), px(O + W))
+        );
+        assert_eq!(
+            table_visible_band(px(O), px(W), true),
+            (px(O), px(O + W - g))
+        );
+        // Both bands are the `avail` width the scroll clamp assumes.
+        for rtl in [false, true] {
+            let (l, r) = table_visible_band(px(O), px(W), rtl);
+            assert_eq!(r - l, px(W - g));
+        }
     }
 }

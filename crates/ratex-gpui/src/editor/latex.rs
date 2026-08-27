@@ -1,8 +1,8 @@
 //! LaTeX → edit-tree parsing — the inverse of [`Row::to_latex`]. Rather than hand-write a
 //! LaTeX tokenizer, we reuse RaTeX's own parser (`ratex_parser::parse` → `ParseNode` AST)
 //! and walk that tree into our `Row`/`Atom` model. Best-effort: constructs the model doesn't
-//! represent (accents, fonts, colors, spacing, …) degrade to their inner content or are
-//! dropped, so an existing `$$…$$` block round-trips for editing and never errors on input.
+//! represent (fonts, colors, spacing, …) degrade to their inner content or are dropped,
+//! so an existing `$$…$$` block round-trips for editing and never errors on input.
 
 use crate::editor::model::{Atom, Row};
 use ratex_parser::{ParseNode, parse};
@@ -132,9 +132,13 @@ fn push_node(atoms: &mut Vec<Atom>, node: &ParseNode) {
                 push_node(atoms, n);
             }
         }
-        ParseNode::Accent { base, .. } | ParseNode::AccentUnder { base, .. } => {
-            push_node(atoms, base)
-        }
+        // An accent keeps its base editable (#77) — previously it degraded to the bare
+        // base, so opening `\hat{X}` for editing silently rewrote it as `X`.
+        ParseNode::Accent { label, base, .. } => atoms.push(Atom::Accent {
+            accent: label.clone(),
+            base: node_to_row(base),
+        }),
+        ParseNode::AccentUnder { base, .. } => push_node(atoms, base),
         ParseNode::Overline { body, .. }
         | ParseNode::Underline { body, .. }
         | ParseNode::VPhantom { body, .. }
@@ -194,6 +198,47 @@ mod tests {
                 index: Some(Row::syms("3")),
             }],
         });
+    }
+
+    #[test]
+    fn roundtrips_accent() {
+        // The #77 data-loss guard: `\hat{X}` must survive parse → serialize unchanged.
+        roundtrip(Row {
+            atoms: vec![Atom::Accent {
+                accent: r"\hat".into(),
+                base: Row::syms("X"),
+            }],
+        });
+    }
+
+    /// Every accent the editor can insert must round-trip through RaTeX and lay out —
+    /// guards against shipping a `Command::Accent` the engine can't parse.
+    #[test]
+    fn accent_variants_roundtrip_and_lay_out() {
+        for accent in [
+            r"\hat",
+            r"\widehat",
+            r"\bar",
+            r"\vec",
+            r"\tilde",
+            r"\widetilde",
+            r"\dot",
+            r"\ddot",
+            r"\check",
+            r"\breve",
+        ] {
+            let row = Row {
+                atoms: vec![Atom::Accent {
+                    accent: accent.into(),
+                    base: Row::syms("x"),
+                }],
+            };
+            let latex = row.to_latex();
+            assert_eq!(parse_latex(&latex), row, "{latex} round-trips");
+            let nodes = parse(&latex).unwrap_or_else(|_| panic!("RaTeX parses {latex}"));
+            let lbox = ratex_layout::layout(&nodes, &ratex_layout::LayoutOptions::default());
+            assert!(lbox.width > 0.0, "{latex} lays out to a non-empty box");
+        }
     }
 
     #[test]

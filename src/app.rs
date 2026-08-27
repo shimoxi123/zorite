@@ -16,13 +16,15 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use rust_i18n::t;
+
 use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     Entity, EventEmitter, FocusHandle, Focusable, Global, ImageFormat, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
     Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Subscription,
     Task, TitlebarOptions, WeakEntity, Window, WindowAppearance, WindowBounds, WindowDecorations,
-    WindowHandle, WindowOptions, div, point, px, size,
+    WindowHandle, WindowOptions, div, point, prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     Root, Sizable, TitleBar, WindowExt,
@@ -94,6 +96,28 @@ pub enum TabKind {
     Properties,
     /// The hidden brick-breaker (`/play`).
     Game,
+}
+
+impl OpenTab {
+    /// The title to show in the tab strip.
+    ///
+    /// App-named tabs (Journal, All pages, Graph, Properties) resolve their
+    /// label from the catalog on every render, NOT from the cached `title`:
+    /// that field is filled once when the tab opens, so a tab already open
+    /// when the language changed would keep its old-language name forever.
+    /// Tabs named after user data — a page, a PDF, a whiteboard — keep the
+    /// cached title, because that text IS the user's and must not be
+    /// translated.
+    pub fn display_title(&self) -> SharedString {
+        match self.kind {
+            TabKind::Journal => t!("app_err.journal_tab").into(),
+            TabKind::AllPages => t!("app_err.all_pages").into(),
+            TabKind::Graph => t!("app_err.graph_tab").into(),
+            TabKind::Properties => t!("app_err.properties_tab").into(),
+            // Game is a bare glyph; pages/PDFs/whiteboards are user data.
+            _ => self.title.clone(),
+        }
+    }
 }
 
 /// An open tab: its content kind + a cached title for the tab strip.
@@ -270,12 +294,12 @@ impl TableDesign {
         TableDesign::Minimal,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self) -> SharedString {
         match self {
-            TableDesign::Grid => "Grid",
-            TableDesign::Striped => "Striped",
-            TableDesign::Header => "Header",
-            TableDesign::Minimal => "Minimal",
+            TableDesign::Grid => t!("app_err.grid").into(),
+            TableDesign::Striped => t!("app_err.striped").into(),
+            TableDesign::Header => t!("app_err.header").into(),
+            TableDesign::Minimal => t!("app_err.minimal").into(),
         }
     }
 
@@ -381,6 +405,10 @@ pub struct AppView {
     /// (used to resolve Auto).
     mode: theme::Mode,
     system_dark: bool,
+    /// UI language choice ("auto" / "en" / "zh-CN"), persisted. "auto"
+    /// resolves to the OS locale at boot and on change; the concrete locale is
+    /// pushed into `rust-i18n`'s global so `t!` reads it at render time.
+    language: String,
     /// The open Settings window, if any (focused instead of duplicated).
     settings_window: Option<WindowHandle<gpui_component::Root>>,
     /// Available themes (built-ins + user) and the active one's id.
@@ -582,6 +610,9 @@ pub struct AppView {
     /// When collapsed, the sidebar shrinks to a thin icon rail (expand caret +
     /// the calendar/settings icons); the page list and search box hide.
     pub sidebar_collapsed: bool,
+    /// Dock the sidebar on the right edge of the window instead of the left
+    /// (Settings → Appearance; handy for RTL-leaning layouts).
+    pub sidebar_right: bool,
     /// Ids of recently-viewed named pages, most-recent first (capped). The
     /// sidebar page tree is filtered to these; persisted across launches.
     pub recent_pages: Vec<i64>,
@@ -708,9 +739,12 @@ impl AppView {
 
         // The page-name field shown in the "New page" dialog (opened from the
         // pages-area right-click menu).
-        let new_page_input = cx.new(|cx| InputState::new(window, cx).placeholder("Page name…"));
+        let new_page_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(t!("app_err.page_title_placeholder"))
+        });
 
-        let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search…"));
+        let search_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("app_err.search_placeholder")));
         let search_sub = cx.subscribe_in(
             &search_input,
             window,
@@ -798,13 +832,14 @@ impl AppView {
             tab_strip_bounds: Rc::new(Cell::new(Bounds::default())),
             tabs: vec![OpenTab {
                 kind: TabKind::Journal,
-                title: "Journal".into(),
+                title: t!("app_err.journal_tab").into(),
             }],
             active: 0,
             searching: false,
             tab_scroll: ScrollHandle::new(),
             mode: theme::Mode::Auto,
             system_dark: true,
+            language: "auto".to_string(),
             settings_window: None,
             skins: skins::builtin_skins(),
             skin_id: String::new(),
@@ -876,6 +911,7 @@ impl AppView {
             calendar_days: Default::default(),
             show_calendar: false,
             sidebar_collapsed: false,
+            sidebar_right: false,
             recent_pages: Vec::new(),
             favorites: Vec::new(),
             collapsed_nodes: HashSet::new(),
@@ -931,6 +967,21 @@ impl AppView {
             .get_setting("theme_mode")
             .map(|s| theme::Mode::from_str(&s))
             .unwrap_or_default();
+        // UI language: load the persisted choice (default "auto") and push the
+        // resolved locale into rust-i18n's global before the first paint, so
+        // every `t!` call site renders in the right language. Mirrors the
+        // theme_mode load above.
+        this.language = this
+            .db
+            .get_setting("language")
+            .unwrap_or_else(|| "auto".to_string());
+        crate::i18n::apply_locale(&this.language);
+        // Mirror to the sidecar on every load, not just on change: a notebook
+        // that chose its language before the sidecar existed would otherwise
+        // keep showing an English unlock screen until someone happened to
+        // touch the setting again. Writing it here means the NEXT launch is
+        // already right, with no user action.
+        crate::paths::save_language(&this.language);
         this.pdf_quality = this
             .db
             .get_setting("pdf_quality")
@@ -982,6 +1033,11 @@ impl AppView {
         this.line_numbers = this
             .db
             .get_setting("line_numbers")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        this.sidebar_right = this
+            .db
+            .get_setting("sidebar_right")
             .map(|v| v == "1")
             .unwrap_or(false);
         this.auto_link.set(
@@ -1061,6 +1117,7 @@ impl AppView {
         self.ensure_content_mermaid(&content, cx);
         self.ensure_content_math(&content, cx);
         self.ensure_content_embeds(&content, cx);
+        self.ensure_content_parsed(&content, cx);
         let key = date.clone();
         let sub = cx.subscribe_in(
             &state,
@@ -1168,6 +1225,9 @@ impl AppView {
                 this.slash = None;
                 let value = bstate.read(cx).text().to_string();
                 this.flush_journal(&bkey, &value);
+                // The reader takes this day back now, so whatever was just
+                // typed/pasted (a CSV table, say) warms off-thread.
+                this.ensure_content_parsed(&value, cx);
                 // Link re-index changed backlinks elsewhere — sync windows.
                 this.signal_doc_changed(cx);
                 cx.notify();
@@ -1212,7 +1272,10 @@ impl AppView {
             if let Some(de) = self.day_editors.get(&date)
                 && de.state.read(cx).value() != content
             {
-                de.state.update(cx, |s, cx| s.set_text(content, cx));
+                de.state.update(cx, |s, cx| s.set_text(content.clone(), cx));
+                // Another window changed this day — warm the new text so the
+                // reader doesn't fall back to plain text on the next frame.
+                self.ensure_content_parsed(&content, cx);
             }
         }
     }
@@ -1627,15 +1690,15 @@ impl AppView {
                 }
                 "allpages" => self.tabs.push(OpenTab {
                     kind: TabKind::AllPages,
-                    title: "All pages".into(),
+                    title: t!("app_err.all_pages").into(),
                 }),
                 "graph" => self.tabs.push(OpenTab {
                     kind: TabKind::Graph,
-                    title: "Graph".into(),
+                    title: t!("app_err.graph_tab").into(),
                 }),
                 "properties" => self.tabs.push(OpenTab {
                     kind: TabKind::Properties,
-                    title: "Properties".into(),
+                    title: t!("app_err.properties_tab").into(),
                 }),
                 _ => {}
             }
@@ -1882,6 +1945,9 @@ impl AppView {
         self.ensure_content_mermaid(&page.content, cx);
         self.ensure_content_math(&page.content, cx);
         self.ensure_content_embeds(&page.content, cx);
+        // Frontend form, not `page.content`: the reader renders what the
+        // editor holds, and the parse cache is keyed on the exact string.
+        self.ensure_content_parsed(&page_content, cx);
         let sub = cx.subscribe_in(
             &state,
             window,
@@ -1985,6 +2051,8 @@ impl AppView {
                 this.slash = None;
                 let value = bstate.read(cx).text().to_string();
                 this.persist(pid, &value);
+                // Same as the journal day's blur: the reader renders this now.
+                this.ensure_content_parsed(&value, cx);
                 this.refresh_sidebar();
                 this.signal_doc_changed(cx);
                 cx.notify();
@@ -2014,7 +2082,7 @@ impl AppView {
         let aliases = self.db.get_page_aliases(pid).unwrap_or_default().join(", ");
         let alias_state = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("alias1, alias2, …")
+                .placeholder(t!("app_err.alias_hint"))
                 .default_value(aliases)
         });
         let alias_sub = cx.subscribe_in(
@@ -2462,8 +2530,10 @@ impl AppView {
             }
             Act::OpenPicker(target, start, caret) => {
                 self.slash = None;
-                let rows_input = cx.new(|cx| InputState::new(window, cx).placeholder("rows"));
-                let cols_input = cx.new(|cx| InputState::new(window, cx).placeholder("cols"));
+                let rows_input =
+                    cx.new(|cx| InputState::new(window, cx).placeholder(t!("app_err.table_rows")));
+                let cols_input =
+                    cx.new(|cx| InputState::new(window, cx).placeholder(t!("app_err.table_cols")));
                 self.table_picker = Some(TablePicker {
                     target,
                     start,
@@ -3160,7 +3230,7 @@ impl AppView {
         let title: SharedString = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "PDF".to_string())
+            .unwrap_or_else(|| t!("all_pages.type_pdf").into_owned())
             .into();
         self.tabs.push(OpenTab {
             kind: TabKind::Pdf(path.clone()),
@@ -3495,8 +3565,8 @@ impl AppView {
             Err(e) => {
                 log::error!("read pdf for form write: {e}");
                 self.show_error_dialog(
-                    "Couldn’t save the field",
-                    format!("Reading the PDF failed: {e}"),
+                    t!("app_err.save_pdf_field_failed"),
+                    t!("app_err.pdf_read_failed", e = e.to_string()).into_owned(),
                     window,
                     cx,
                 );
@@ -3506,8 +3576,8 @@ impl AppView {
         let Some(new) = gpui_pdf::set_form_value(&bytes, name, value) else {
             log::error!("form write refused: field {name:?}");
             self.show_error_dialog(
-                "Couldn’t save the field",
-                format!("The PDF rejected a write to “{name}” (it may be read-only)."),
+                t!("app_err.save_pdf_field_failed"),
+                t!("app_err.pdf_write_rejected", name = name).into_owned(),
                 window,
                 cx,
             );
@@ -3516,8 +3586,8 @@ impl AppView {
         if let Err(e) = std::fs::write(path, &new) {
             log::error!("save pdf form write: {e}");
             self.show_error_dialog(
-                "Couldn’t save the field",
-                format!("Writing the PDF failed: {e}"),
+                t!("app_err.save_pdf_field_failed"),
+                t!("app_err.pdf_write_failed", e = e.to_string()).into_owned(),
                 window,
                 cx,
             );
@@ -3609,7 +3679,7 @@ impl AppView {
         }
         self.tabs.push(OpenTab {
             kind: TabKind::AllPages,
-            title: "All pages".into(),
+            title: t!("app_err.all_pages").into(),
         });
         self.activate_tab(self.tabs.len() - 1, window, cx);
     }
@@ -3847,7 +3917,9 @@ impl AppView {
     /// Open (or focus) the graph view tab, rebuilding nodes and layout.
     pub fn open_graph(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.graph_search.is_none() {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search nodes…"));
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t!("app_err.search_nodes_placeholder"))
+            });
             let sub = cx.subscribe_in(
                 &input,
                 window,
@@ -3870,7 +3942,7 @@ impl AppView {
         }
         self.tabs.push(OpenTab {
             kind: TabKind::Graph,
-            title: "Graph".into(),
+            title: t!("app_err.graph_tab").into(),
         });
         self.activate_tab(self.tabs.len() - 1, window, cx);
     }
@@ -3887,7 +3959,7 @@ impl AppView {
         }
         self.tabs.push(OpenTab {
             kind: TabKind::Properties,
-            title: "Properties".into(),
+            title: t!("app_err.properties_tab").into(),
         });
         self.activate_tab(self.tabs.len() - 1, window, cx);
     }
@@ -4259,7 +4331,7 @@ impl AppView {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Place".into()),
+            prompt: Some(t!("app_err.place").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
@@ -4317,8 +4389,13 @@ impl AppView {
             Err(e) => {
                 log::error!("import image {}: {e}", path.display());
                 self.show_error_dialog(
-                    "Couldn’t add the image",
-                    format!("Importing {} failed: {e}", path.display()),
+                    t!("app_err.add_image_failed"),
+                    t!(
+                        "app_err.import_image_failed_fmt",
+                        path = path.display(),
+                        e = e.to_string()
+                    )
+                    .into_owned(),
                     window,
                     cx,
                 );
@@ -4388,7 +4465,7 @@ impl AppView {
                     files: true,
                     directories: false,
                     multiple: false,
-                    prompt: Some("Use font".into()),
+                    prompt: Some(t!("app_err.place").into()),
                 });
                 cx.spawn_in(window, async move |this, cx| {
                     let Ok(Ok(Some(paths))) = rx.await else {
@@ -4564,20 +4641,20 @@ impl AppView {
                         div()
                             .text_size(px(15.0))
                             .text_color(theme::text_primary())
-                            .child("🔒 This PDF is password protected"),
+                            .child(t!("app_err.pdf_locked")),
                     )
                     .child(Input::new(&self.pdf_password_input).small().mask_toggle())
                     .children(failed.then(|| {
                         div()
                             .text_size(px(12.0))
                             .text_color(gpui::rgb(0xE5484D))
-                            .child("Incorrect password — try again.")
+                            .child(t!("app_err.pdf_wrong_password"))
                     }))
                     .child(
                         div().flex().justify_end().child(
                             Button::new("pdf-unlock")
                                 .small()
-                                .label("Unlock")
+                                .label(t!("app_err.pdf_unlock"))
                                 .primary()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.unlock_pdf(&path, window, cx);
@@ -5247,6 +5324,52 @@ impl AppView {
         self.mode
     }
 
+    /// The persisted UI-language choice ("auto" / "en" / "zh-CN"), for the
+    /// Settings picker to pre-select.
+    pub fn language(&self) -> &str {
+        &self.language
+    }
+
+    /// Set the UI language, push it into rust-i18n's global, persist, and
+    /// re-render every open window so all `t!` call sites pick up the new
+    /// locale live. Mirrors [`set_theme_mode`]'s apply-then-persist flow; the
+    /// `cx.refresh_windows()` is the same notify-all-windows helper the theme
+    /// switch uses.
+    pub fn set_language(&mut self, choice: &str, cx: &mut Context<Self>) {
+        if choice == self.language {
+            return;
+        }
+        self.language = choice.to_string();
+        crate::i18n::apply_locale(choice);
+        // Re-inject the localized labels into the open editors so their
+        // context menus / chrome follow the new language immediately.
+        let labels = crate::i18n::editor_labels();
+        let states: Vec<Entity<EditorState>> = self
+            .day_editors
+            .values()
+            .map(|de| de.state.clone())
+            .chain(self.page_editor.as_ref().map(|pe| pe.state.clone()))
+            .collect();
+        for state in states {
+            state.update(cx, |editor, cx| editor.set_labels(labels.clone(), cx));
+        }
+        // Rebuild the native menu bar / titlebar menus so their labels follow
+        // the new language immediately (installed once at boot).
+        crate::actions::set_app_menu(cx);
+        // Drop the slash-palette flyout cache: it is keyed on (level, title)
+        // with no locale, so its rows would keep the language they were built
+        // in until the level or the note title happened to change. Same trap
+        // as the tab titles — a translated string held in state outlives the
+        // switch that should have replaced it.
+        *self.slash_flyout_cache.borrow_mut() = None;
+        let _ = self.db.set_setting("language", choice);
+        // Mirror it outside the database too: on a locked notebook the unlock
+        // screen renders before anything can decrypt the settings table, so
+        // the sidecar is the only way it can know which language to speak.
+        crate::paths::save_language(choice);
+        cx.refresh_windows();
+    }
+
     /// The available themes (for the Settings picker).
     pub fn skins(&self) -> &[Skin] {
         &self.skins
@@ -5268,7 +5391,7 @@ impl AppView {
 
     /// Resolve the active skin + mode (+ OS appearance for Auto) to a
     /// palette and push it live to every window.
-    fn apply_theme(&self, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let skin = self.current_skin();
         // A dark-only theme ignores the Light/Dark/Auto setting and forces dark,
         // so the window chrome / titlebar matches its always-dark content.
@@ -5297,8 +5420,34 @@ impl AppView {
         theme::apply(palette, is_dark, window, cx);
         theme::set_ui_font(&font, cx);
         // Diagrams are themed at render time — drop the cache so they re-render
-        // with the new palette (Rc<RefCell>, so this is fine from `&self`).
+        // with the new palette.
         self.mermaid_store.borrow_mut().clear();
+        // Formulas are tinted at render time too, and were being missed here: a
+        // raster rendered for the dark palette is white, so after one visit to a
+        // dark theme every light theme showed an invisible formula over the
+        // spacer it had reserved. `set_color` drops them only when the tint
+        // actually changed. Block math re-renders itself on a cache miss, but
+        // INLINE math deliberately doesn't (it relies on content having been
+        // pre-warmed), so the loaded content is re-warmed here.
+        let retint = self
+            .math_store
+            .borrow_mut()
+            .set_color(theme::text_primary());
+        if retint {
+            let contents: Vec<String> = self
+                .day_editors
+                .values()
+                .map(|de| de.state.read(cx).value().to_string())
+                .chain(
+                    self.page_editor
+                        .as_ref()
+                        .map(|pe| pe.state.read(cx).value().to_string()),
+                )
+                .collect();
+            for content in contents {
+                self.ensure_content_math(&content, cx);
+            }
+        }
         // Open editors hold a SyntaxStyle cloned at creation — re-push it so the
         // inline tag/code/link colors track the new palette live, instead of
         // keeping the old theme's until a restart or a WYSIWYG toggle.
@@ -5586,6 +5735,18 @@ impl AppView {
         self.line_numbers
     }
 
+    /// Dock the sidebar on the right (Settings → Appearance); persisted.
+    pub fn set_sidebar_right(&mut self, right: bool, cx: &mut Context<Self>) {
+        if self.sidebar_right == right {
+            return;
+        }
+        self.sidebar_right = right;
+        let _ = self
+            .db
+            .set_setting("sidebar_right", if right { "1" } else { "0" });
+        cx.notify();
+    }
+
     /// Toggle the page editor's line-number gutter (Settings → Markdown).
     pub fn set_line_numbers(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.line_numbers != on {
@@ -5693,7 +5854,7 @@ impl AppView {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Settings · Zorite".into()),
+                    title: Some(t!("app_err.settings_title").into()),
                     ..TitleBar::title_bar_options()
                 }),
                 window_decorations: Some(WindowDecorations::Client),
@@ -6185,7 +6346,7 @@ impl AppView {
             Ok(None) => {}
             Err(e) => {
                 log::error!("copy page {id} contents: {e}");
-                self.show_error_dialog("Couldn’t copy", e.to_string(), window, cx);
+                self.show_error_dialog(t!("app_err.copy_page_failed"), e.to_string(), window, cx);
             }
         }
     }
@@ -6211,7 +6372,7 @@ impl AppView {
     /// `NewPage` handler: prompt for a title in a dialog, then create and
     /// open the page (dispatched from a pages-area right-click menu).
     fn on_new_page(&mut self, _: &NewPage, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_new_page_dialog("New page", String::new(), window, cx);
+        self.open_new_page_dialog(t!("app_err.new_page"), String::new(), window, cx);
     }
 
     /// `NewSubPage` handler: the same dialog, pre-filled with the
@@ -6221,7 +6382,7 @@ impl AppView {
             return;
         };
         let prefill = format!("{title}{}", crate::hierarchy::SEP);
-        self.open_new_page_dialog("New sub-page", prefill, window, cx);
+        self.open_new_page_dialog(t!("app_err.new_sub_page"), prefill, window, cx);
     }
 
     /// `FitImages` (`⌘⇧I`) handler: shrink *every* image in the active view that
@@ -6332,30 +6493,27 @@ impl AppView {
             return;
         }
         let fresh = !std::path::Path::new(&nb.dir).join("zorite.db").exists();
-        let (title, body): (&'static str, String) = if fresh {
+        let (title, body): (SharedString, String) = if fresh {
             (
-                "Create notebook",
-                format!(
-                    "Zorite will relaunch with a fresh, empty notebook “{}” in:\n{}",
-                    nb.name, nb.dir
-                ),
+                t!("app_err.create_notebook").into(),
+                t!("app_err.create_notebook_body", name = nb.name, dir = nb.dir).into_owned(),
             )
         } else {
             (
-                "Switch notebook",
-                format!("Zorite will relaunch into “{}”:\n{}", nb.name, nb.dir),
+                t!("app_err.switch_notebook").into(),
+                t!("app_err.switch_notebook_body", name = nb.name, dir = nb.dir).into_owned(),
             )
         };
         window.open_alert_dialog(cx, move |dialog, _window, _cx| {
             let nb = nb.clone();
             let body = body.clone();
             dialog
-                .title(title)
+                .title(title.clone())
                 .description(SharedString::from(body))
                 .button_props(
                     DialogButtonProps::default()
-                        .ok_text("Relaunch")
-                        .cancel_text("Cancel")
+                        .ok_text(t!("app_err.relaunch"))
+                        .cancel_text(t!("common.cancel"))
                         .show_cancel(true),
                 )
                 .on_ok(move |_, _window, cx| {
@@ -6379,7 +6537,7 @@ impl AppView {
             files: false,
             directories: true,
             multiple: false,
-            prompt: Some("Use folder".into()),
+            prompt: Some(t!("app_err.place").into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = rx.await else {
@@ -6407,7 +6565,7 @@ impl AppView {
                 cx.notify();
                 self.switch_notebook(nb, window, cx);
             }
-            Err(e) => self.show_error_dialog("Can’t use that folder", e, window, cx),
+            Err(e) => self.show_error_dialog(t!("app_err.cant_use_folder"), e, window, cx),
         }
     }
 
@@ -6599,10 +6757,7 @@ impl Render for AppView {
                                     .text_size(px(10.0))
                                     .text_color(theme::text_tertiary())
                                     .truncate()
-                                    .child(format!(
-                                        "{}  —  ⏎ save · esc cancel · ⇥ next",
-                                        e.field.name
-                                    )),
+                                    .child(t!("app_err.save_hint", name = e.field.name)),
                             )
                             .child(Input::new(&e.input).small())
                             .children((!options.is_empty()).then(|| {
@@ -6832,23 +6987,23 @@ impl Render for AppView {
             // Action ids: 0..=2 formula copy/export, 3 day/page Edit, 4..=6 align L/C/R (only
             // while editing the formula, where the in-line editor can re-justify it live).
             // `(label, icon face, action id)` — icons match the popup menus'.
-            let items: Vec<(&str, &str, usize)> = match &menu.kind {
+            let items: Vec<(std::borrow::Cow<'static, str>, &str, usize)> = match &menu.kind {
                 CtxKind::Formula { alignable, .. } => {
                     let mut v = vec![
-                        ("Copy LaTeX", "copy", 0),
-                        ("Export PNG…", "file-down", 1),
-                        ("Export SVG…", "file-down", 2),
+                        (t!("app_err.math_copy_latex"), "copy", 0),
+                        (t!("app_err.math_export_png"), "file-down", 1),
+                        (t!("app_err.math_export_svg"), "file-down", 2),
                     ];
                     if *alignable {
                         v.extend([
-                            ("Align left", "align-left", 4),
-                            ("Align center", "align-center", 5),
-                            ("Align right", "align-right", 6),
+                            (t!("app_err.math_align_left"), "align-left", 4),
+                            (t!("app_err.math_align_center"), "align-center", 5),
+                            (t!("app_err.math_align_right"), "align-right", 6),
                         ]);
                     }
                     v
                 }
-                CtxKind::Edit(_) => vec![("Edit", "pencil", 3)],
+                CtxKind::Edit(_) => vec![(t!("app_err.math_edit"), "pencil", 3)],
             };
             let mut rows = div().flex().flex_col().py(px(4.0));
             for (label, face, action_id) in items {
@@ -7082,7 +7237,11 @@ impl Render for AppView {
                     .text_color(theme::text_secondary())
                     .cursor_pointer()
                     .hover(|h| h.bg(theme::hover()).text_color(theme::text_primary()))
-                    .child(self.mode.label())
+                    .child(match self.mode {
+                        theme::Mode::Light => t!("settings.opt.light"),
+                        theme::Mode::Dark => t!("settings.opt.dark"),
+                        theme::Mode::Auto => t!("settings.opt.auto_appearance"),
+                    })
                     .on_click(cx.listener(|this: &mut AppView, _, window, cx| {
                         this.cycle_theme_mode(window, cx);
                     }));
@@ -7122,6 +7281,8 @@ impl Render for AppView {
                     .min_h_0()
                     .flex()
                     .flex_row()
+                    // Docked right: same children, reversed visual order.
+                    .when(self.sidebar_right, |el| el.flex_row_reverse())
                     .child(ui::sidebar::render(self, window, cx))
                     .child(
                         div()
@@ -7430,6 +7591,10 @@ fn make_editor(
     // `auto_grow(1, 100_000)` InputState approximated.
     let editor = cx.new(|cx| {
         let mut editor = EditorState::new(window, cx).with_text(content);
+        // Localized labels for the editor's context menus / chrome (the crate
+        // stays host-agnostic; the app injects them here and re-injects on
+        // language switch).
+        editor.set_labels(crate::i18n::editor_labels(), cx);
         // Right-click a flagged word → the OS's suggestions, fetched lazily.
         editor.on_suggest(|word| os_spellcheck::SpellChecker::new().suggestions(word));
         // Copy/Cut put rendered HTML on the clipboard beside the raw markdown,
@@ -7614,8 +7779,8 @@ pub(crate) fn date_label(i: usize) -> String {
         dt.year()
     );
     match i {
-        0 => format!("Today · {label}"),
-        1 => format!("Yesterday · {label}"),
+        0 => t!("app_err.today_label", label = label).into_owned(),
+        1 => t!("app_err.yesterday_label", label = label).into_owned(),
         _ => label,
     }
 }
